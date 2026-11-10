@@ -29,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FLUTTER_VERSION: 3.47.7
+  FLUTTER_VERSION: 3.47.9
   NODE_VERSION: 24.22.1
   TZ: Asia/Shanghai
   # 云端用上游官方源：runner 在海外，镜像反而是绕路。sha256 pin 保证换个镜像也是同一批字节。
