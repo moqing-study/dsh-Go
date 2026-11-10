@@ -65,6 +65,9 @@ NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
 TERMUX_REPO="${TERMUX_REPO:-https://packages.termux.dev/apt/termux-main}"
 UBUNTU_ARCHIVE_AMD64="${UBUNTU_ARCHIVE_AMD64:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu}"   # InRelease verified with gpgv
 UBUNTU_ARCHIVE_ARM64="${UBUNTU_ARCHIVE_ARM64:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports}"
+# Security uploads land in their own pool and reach the archive mirrors later; a build that
+# only asks the archive 404s on a package the index already lists.
+UBUNTU_SECURITY_ARCHIVE="${UBUNTU_SECURITY_ARCHIVE:-https://security.ubuntu.com/ubuntu}"
 PBS_OFFICIAL="https://github.com/astral-sh/python-build-standalone/releases/download"
 PBS_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
 
@@ -268,12 +271,22 @@ PYEOF
       [[ "$index_arch" == amd64 ]] && index_mirror="$UBUNTU_ARCHIVE_AMD64" || index_mirror="$mirror"
       rec="$(ubuntu_repin "$index_mirror" "$index_arch" "$base" "$pkg")" \
         || die "no mirror serves $name and the index no longer lists $pkg"
-      IFS=$'\t' read -r _ newfile newsum _ <<<"$rec"
-      name="$(basename "$newfile")"
-      log "stale pin: $pkg re-resolved to $name"
-      fetch_any "$CACHE/ubuntu/debs/$name" "$newsum" \
-        "$UBUNTU_ARCHIVE_AMD64/$newfile" "$mirror/$newfile" \
-        || die "index names $newfile but no mirror serves those bytes"
+      # The index may name an upload whose .deb has not reached a pool we can read yet
+      # (security publishes to security.ubuntu.com before the archive mirrors catch up),
+      # so walk down the versions it offers instead of dying on the newest one.
+      local ok=0
+      while IFS=$'\t' read -r _ newfile newsum _; do
+        [[ -n "${newfile:-}" ]] || continue
+        name="$(basename "$newfile")"
+        if fetch_any "$CACHE/ubuntu/debs/$name" "$newsum" \
+            "$UBUNTU_SECURITY_ARCHIVE/$newfile" "$UBUNTU_ARCHIVE_AMD64/$newfile" "$mirror/$newfile"; then
+          log "stale pin: $pkg re-resolved to $name"
+          ok=1
+          break
+        fi
+        log "  $name is listed but not downloadable yet; trying the next version"
+      done <<<"$rec"
+      [[ "$ok" == 1 ]] || die "index lists $pkg but no mirror serves any of its files"
     fi
     printf '%s\n' "$CACHE/ubuntu/debs/$name"
   done < <(python3 -I -c 'import json,sys; [print("\t".join((p["package"], p["filename"], p["sha256"], p["architecture"]))) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")

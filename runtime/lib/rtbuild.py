@@ -7,6 +7,7 @@ inputs it reads; downloaded archives are treated as data.
 """
 import argparse
 import gzip
+from functools import cmp_to_key
 import hashlib
 import io
 import json
@@ -542,26 +543,31 @@ def cmd_repin(args):
     package, picking the highest version the indexes offer.
     """
     wanted = set(args.package)
-    best = {}
+    found = {name: [] for name in wanted}
     for path in args.packages:
         with open(path, "rb") as f:
             raw = f.read()
         text = (lzma.decompress(raw) if path.endswith(".xz") else raw).decode()
         for s in parse_stanzas(text):
-            if s.get("Package") not in wanted or s.get("Architecture") not in (args.arch, "all"):
+            if s.get("Package") in wanted and s.get("Architecture") in (args.arch, "all"):
+                found[s["Package"]].append(s)
+    if not any(found.values()):
+        raise SystemExit("repin: no index entry for " + ", ".join(sorted(wanted)))
+    # Highest version first, and every version, not just the top one: an index can list an
+    # upload whose .deb has not reached the pool yet (security publishes to its own host
+    # first), so the caller needs somewhere to fall back to instead of dying on that one.
+    for name in sorted(found):
+        rows, seen = [], set()
+        for s in sorted(found[name], key=cmp_to_key(lambda a, b: debver_cmp(a["Version"], b["Version"])), reverse=True):
+            if s["Filename"] in seen:
                 continue
-            cur = best.get(s["Package"])
-            if cur is None or debver_cmp(s["Version"], cur["Version"]) > 0:
-                best[s["Package"]] = s
-    missing = sorted(wanted - set(best))
-    if missing:
-        raise SystemExit("repin: no index entry for " + ", ".join(missing))
-    for name in sorted(best):
-        s = best[name]
-        for field in ("Filename", "SHA256"):
-            if not s.get(field):
-                raise SystemExit("repin: index entry for %s has no %s" % (name, field))
-        print("\t".join((name, s["Filename"], s["SHA256"], s["Version"])))
+            seen.add(s["Filename"])
+            if not s.get("Filename") or not s.get("SHA256"):
+                continue
+            rows.append("\t".join((name, s["Filename"], s["SHA256"], s["Version"])))
+        if not rows:
+            raise SystemExit("repin: index entry for %s has no Filename/SHA256" % name)
+        print("\n".join(rows))
 
 
 def cmd_resolve_debs(args):
