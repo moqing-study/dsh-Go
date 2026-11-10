@@ -56,8 +56,51 @@ def run(argv: list[str]) -> None:
 
 
 def unpack(rootfs: str, dest: str) -> None:
-    with tarfile.open(rootfs, "r:xz") as tar:
-        tar.extractall(dest)
+    """解包。**必须用 GNU tar,不能用 Python 的 tarfile。**
+
+    缓存里存的是上一版 overlay 的产物,而上一版打出过畸形归档:每个文件除了
+    正常条目,后面还跟着两条 `link to <它自己>`。两种解包器对自指硬链接的
+    处理完全相反:
+
+    - Python tarfile 的 makelink 先 `os.unlink(targetpath)` 再 link,目标是
+      它自己 → 文件被删掉、link 报 FileNotFoundError 被 errorlevel=1 吞掉,
+      归档里 265595 个条目解出来是一棵**缺文件**的树。
+    - GNU tar 解包时发现目标已存在且就是自己,跳过这条链接,文件留下。
+
+    已在真机上验证前者:proot 报 `'/usr/bin/env' not found` 后 1.3 秒退出。
+    所以这里用 GNU tar,并且解完立刻断言关键文件都在(见 check_tree)。
+    """
+    proc = subprocess.run(
+        ["tar", "-xJf", rootfs, "-C", dest, "--no-same-owner", "--numeric-owner"],
+        capture_output=True, text=True,
+    )
+    # 0=干净,2=有警告但已尽力(自指硬链接就归这里),其它值是真失败。
+    if proc.returncode not in (0, 2):
+        sys.exit("解包失败(exit %d):%s" % (proc.returncode, proc.stderr[-1500:]))
+    if proc.stderr.strip():
+        print("unpack warnings: %s" % proc.stderr.strip().splitlines()[-1][:300], flush=True)
+
+
+def check_tree(dest: str) -> None:
+    """解包后的树必须真的能用。缓存里可能是上一版打坏的归档。
+
+    这些检查放在 overlay 之前:不通过就 2 分钟内失败,而不是先花 20 分钟
+    压缩一棵残缺的树,再在最后一步红掉。
+    """
+    for path in REQUIRED_FILES:
+        full = os.path.join(dest, path)
+        if not os.path.isfile(full) or os.path.islink(full):
+            sys.exit(
+                "解包后缺 %s。缓存里的基础 rootfs 是坏归档(自指硬链接被解包器删掉了),"
+                "需要让 runtime job 重新全量组装一次。" % path
+            )
+    env = os.path.join(dest, "usr/bin/env")
+    with open(env, "rb") as fh:
+        head = fh.read(4)
+    if head != b"\x7fELF":
+        sys.exit("解包后的 usr/bin/env 不是 ELF(前 4 字节 %r)" % head)
+    if not os.stat(env).st_mode & 0o111:
+        sys.exit("解包后的 usr/bin/env 没有可执行位,proot 会拒绝执行")
 
 
 def overlay_plugin(dest: str) -> int:
@@ -246,6 +289,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="notara-overlay-") as work:
         print("unpacking %s" % args.rootfs, flush=True)
         unpack(args.rootfs, work)
+        check_tree(work)
         copied = overlay_plugin(work)
         patch_config(work)
         digest = overlay_digest(work)
