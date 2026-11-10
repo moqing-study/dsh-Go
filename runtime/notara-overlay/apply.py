@@ -89,10 +89,13 @@ def check_tree(dest: str) -> None:
     """
     for path in REQUIRED_FILES:
         full = os.path.join(dest, path)
-        if not os.path.isfile(full) or os.path.islink(full):
+        # lexists:链接本身存在就算在。用 exists 会跟随目标,isfile 也是跟随的,
+        # 两者叠加会把"指向 dash 的 usr/bin/sh"误判成缺失——这个误报让第一次
+        # 用预置 base 的构建白红了一轮。
+        if not os.path.lexists(full):
             sys.exit(
-                "解包后缺 %s。缓存里的基础 rootfs 是坏归档(自指硬链接被解包器删掉了),"
-                "需要让 runtime job 重新全量组装一次。" % path
+                "解包后缺 %s。基础 rootfs 的解包结果不完整(自指硬链接被解包器删掉了?),"
+                "需要重新全量组装一份。" % path
             )
     env = os.path.join(dest, "usr/bin/env")
     with open(env, "rb") as fh:
@@ -101,6 +104,15 @@ def check_tree(dest: str) -> None:
         sys.exit("解包后的 usr/bin/env 不是 ELF(前 4 字节 %r)" % head)
     if not os.stat(env).st_mode & 0o111:
         sys.exit("解包后的 usr/bin/env 没有可执行位,proot 会拒绝执行")
+    # 符号链接另外查:被删掉的符号链接不会以"文件缺失"的形式出现,只会让
+    # usr/bin/sh 这个路径彻底不存在,上面那条已经覆盖;这里额外确认它没被
+    # 退化成普通文件或者指向别处。
+    for path, target in (("usr/bin/sh", "dash"),):
+        full = os.path.join(dest, path)
+        if not os.path.islink(full):
+            sys.exit("解包后的 %s 不是符号链接" % path)
+        if os.readlink(full) != target:
+            sys.exit("解包后的 %s 指向 %s,应为 %s" % (path, os.readlink(full), target))
 
 
 def overlay_plugin(dest: str) -> int:
