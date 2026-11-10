@@ -537,7 +537,8 @@ for name, (pkg, ver, deb, inner, patch, orig) in src.items():
     }
 json.dump(res, open(out, "w"), indent=2)
 PYEOF
-  # licenses for the native bits
+  # licenses for the native bits (--jni-only 时 assets/licenses 可能不存在,先建目录)
+  mkdir -p "$assets/licenses"
   python3 -I - "$proot_src" "$assets/licenses/proot-COPYING.txt" <<'PYEOF'
 import sys, zipfile
 z = zipfile.ZipFile(sys.argv[1])
