@@ -125,9 +125,14 @@ void main() {
         [for (final s in shortcuts) attr(s, 'action')],
         [_constant(entry, 'ACTION_NEW_CHAT'), _constant(entry, 'ACTION_VOICE')],
       );
+      // targetPackage follows the applicationId (the coexist build appends a
+      // suffix), while targetClass follows EntryActivity's real namespace path.
+      final entryPackage = RegExp(r'^package ([\w.]+)', multiLine: true)
+          .firstMatch(entry)!
+          .group(1)!;
       for (final s in shortcuts) {
         expect(attr(s, 'targetPackage'), applicationId);
-        expect(attr(s, 'targetClass'), '$applicationId.shortcuts.EntryActivity');
+        expect(attr(s, 'targetClass'), '$entryPackage.EntryActivity');
       }
     });
   });

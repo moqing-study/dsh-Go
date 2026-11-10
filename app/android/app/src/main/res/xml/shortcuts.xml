@@ -2,7 +2,8 @@
 <!-- Long-press on the launcher icon: 新对话 and 语音输入 (static), then up to three recent
      conversations (dynamic, shortcuts/ShortcutsPlugin.kt). All go through the non-exported
      shortcuts/EntryActivity; launchers start shortcuts as this app, so it needs no export.
-     targetPackage is the applicationId (no build-type suffix today; add one and this breaks). -->
+     targetPackage is the applicationId (the coexist build appends a suffix there, while
+     targetClass keeps the unchanged namespace class path). -->
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
     <shortcut
         android:shortcutId="new_chat"
@@ -13,7 +14,7 @@
         <intent
             android:action="io.github.ccch1mneyyy.dsh_app.action.NEW_CHAT"
             android:targetClass="io.github.ccch1mneyyy.dsh_app.shortcuts.EntryActivity"
-            android:targetPackage="io.github.ccch1mneyyy.dsh_app" />
+            android:targetPackage="io.github.ccch1mneyyy.dsh_app.notara" />
     </shortcut>
     <shortcut
         android:shortcutId="voice_input"
@@ -24,6 +25,6 @@
         <intent
             android:action="io.github.ccch1mneyyy.dsh_app.action.VOICE_INPUT"
             android:targetClass="io.github.ccch1mneyyy.dsh_app.shortcuts.EntryActivity"
-            android:targetPackage="io.github.ccch1mneyyy.dsh_app" />
+            android:targetPackage="io.github.ccch1mneyyy.dsh_app.notara" />
     </shortcut>
 </shortcuts>

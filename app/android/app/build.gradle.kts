@@ -42,6 +42,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // BuildConfig.APPLICATION_ID lets "own package" constants follow the
+    // coexist applicationId instead of the namespace.
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         // Coexists with the upstream app: a different applicationId (+ notara
         // suffix) installs alongside it instead of replacing it. The namespace
