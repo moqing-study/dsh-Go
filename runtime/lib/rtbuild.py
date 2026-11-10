@@ -28,6 +28,8 @@ NPMJS = "https://registry.npmjs.org/"
 DSH_WEB_PATCH = "/etc/dsh-app/dsh-web.patch.yml"
 # Where runtime/bridge/dsh-go-bridge lands in the rootfs (loaded by absolute path from the overlay).
 DSH_GO_BRIDGE = "/opt/dsh-go/dsh-go-bridge"
+# Where EXTRA_PLUGINS entries land: /opt/dsh-go/plugins/<id>, one overlay row each.
+EXTRA_PLUGIN_DIR = "/opt/dsh-go/plugins"
 # runtime/boot/boot-cache.mjs: path cache for `dsh web` while it boots, preloaded by the dsh shim.
 BOOT_CACHE = "/opt/dsh-go/boot-cache.mjs"
 BOOT_CACHE_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "boot", "boot-cache.mjs")
@@ -831,7 +833,26 @@ def bridge_shared_rows():
                         "name: %s/lib/companion/full-context.js" % DSH_GO_BRIDGE)
 
 
-def overlay_entries(runtime_info, with_python=False, with_pnpm=False, with_bridge=False):
+def _plugin_rows(plugins):
+    """Overlay rows for plugins mounted from outside the repo (build-runtime.sh EXTRA_PLUGINS)."""
+    rows = ""
+    for pid, path in plugins:
+        meta = {}
+        package_json = os.path.join(path, "package.json")
+        if os.path.isfile(package_json):
+            with open(package_json, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        entry = meta.get("main") or "index.js"
+        entry = entry[2:] if entry.startswith("./") else entry.lstrip("/")
+        rows += ("    # %s@%s: baked into the runtime from outside this repo, so it is loaded by\n"
+                 "    # path here and never installed into a profile (see EXTRA_PLUGINS).\n"
+                 "    - id: %s\n"
+                 "      name: %s/%s/%s\n"
+                 % (meta.get("name") or pid, meta.get("version") or "?", pid, EXTRA_PLUGIN_DIR, pid, entry))
+    return rows
+
+
+def overlay_entries(runtime_info, with_python=False, with_pnpm=False, with_bridge=False, plugins=()):
     """Files dsh-app adds to the rootfs. Kept here so the recipe lives in one place."""
     E = {}
 
@@ -901,7 +922,7 @@ def overlay_entries(runtime_info, with_python=False, with_pnpm=False, with_bridg
         # what `npm i -g pnpm` creates under npm's global prefix (/usr/local)
         for name, target in PNPM_BINS.items():
             s("usr/local/bin/" + name, "../lib/node_modules/pnpm/bin/" + target)
-    if with_pnpm or with_bridge:
+    if with_pnpm or with_bridge or plugins:
         patch = ("# dsh-app: overlay for `dsh web`, passed with --patch by the app's launch command and\n"
                  "# replaced on every runtime upgrade (edits here do not survive one).\n")
         if with_pnpm:
@@ -925,7 +946,10 @@ def overlay_entries(runtime_info, with_python=False, with_pnpm=False, with_bridg
                       "- insert:\n"
                       "    - id: dsh-go-bridge\n"
                       "      name: %s/lib/index.js\n" % DSH_GO_BRIDGE)
+            patch += _plugin_rows(plugins)
             patch += bridge_shared_rows()
+        elif plugins:
+            patch += "- insert:\n" + _plugin_rows(plugins)
         f(DSH_WEB_PATCH.lstrip("/"), patch)
     d("root/.dsh", 0o700)
     d("root/.l2s", 0o700)          # PROOT_L2S_DIR: hard-link backing files (kept with /root on upgrade)
@@ -1176,10 +1200,20 @@ def cmd_assemble(args):
                  "pnpm", pnpm_drop_reason)
     if args.bridge:
         add_tree(args.bridge, DSH_GO_BRIDGE.lstrip("/"), "bridge", lambda rel, abi, prune: None)
+    # --plugin id=dir: an out-of-repo Cordis plugin, mounted and given an overlay row. Same
+    # pruning as the DSH tree (foreign prebuilds, Windows binaries, dev metadata) so a package
+    # that ships every platform does not cost the phone any of them.
+    plugins = []
+    for spec in args.plugin or []:
+        pid, sep, path = spec.partition("=")
+        if not sep or not pid or not path:
+            raise SystemExit("--plugin wants id=directory, got: " + spec)
+        plugins.append((pid, path))
+        add_tree(path, (EXTRA_PLUGIN_DIR + "/" + pid).lstrip("/"), "plugin", dsh_drop_reason)
 
     # 4. dsh-app overlay (wins over everything above)
     for p, e in overlay_entries(runtime_info, with_python=bool(args.python), with_pnpm=bool(args.pnpm_prefix),
-                                with_bridge=bool(args.bridge)).items():
+                                with_bridge=bool(args.bridge), plugins=plugins).items():
         entries[p] = e
 
     # 5. ELF audit + arch/libc pruning; Termux-style fixes for node-pty helpers
@@ -1197,7 +1231,7 @@ def cmd_assemble(args):
             report["warnings"].append("unparsable ELF %s: %s" % (p, exc))
             continue
         if info["e_machine"] != machine:
-            if e.origin in ("dsh", "pnpm"):
+            if e.origin in ("dsh", "pnpm", "plugin"):
                 # unusable on this ABI; keep the build going but make it visible
                 drop("foreign-arch-elf", p, len(data))
                 report["warnings"].append("pruned %s ELF from npm tree (package lacks a %s build?): %s"
@@ -1206,7 +1240,7 @@ def cmd_assemble(args):
                 continue
             raise SystemExit("ELF %s is %s, expected %s" % (p, info["machine"], EM_NAMES[machine]))
         if info["musl"]:
-            if e.origin in ("dsh", "pnpm"):
+            if e.origin in ("dsh", "pnpm", "plugin"):
                 drop("musl-elf", p, len(data))
                 del entries[p]
                 continue
@@ -1551,6 +1585,8 @@ def main():
     p.add_argument("--deb", action="append", help="extra .deb to unpack and register (no maintainer scripts)")
     p.add_argument("--python", help="python-build-standalone install_only tarball -> /opt/python")
     p.add_argument("--bridge", help="dsh-go-bridge package dir -> " + DSH_GO_BRIDGE + " (+ overlay row)")
+    p.add_argument("--plugin", action="append", metavar="ID=DIR",
+                   help="extra Cordis plugin -> " + EXTRA_PLUGIN_DIR + "/ID (+ overlay row); repeatable")
     p.set_defaults(fn=cmd_assemble)
 
     p = sub.add_parser("manifest")

@@ -56,12 +56,15 @@ XZ_THREADS="${XZ_THREADS:-4}"       # each xz -6 worker needs ~100 MiB; output d
 PRUNE_DEV_METADATA="${PRUNE_DEV_METADATA:-1}"   # drop *.map / *.d.ts from node_modules
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1767225600}"  # 2026-01-01T00:00:00Z, fixed tar mtimes
 
-UBUNTU_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release"
-NODE_MIRROR="https://npmmirror.com/mirrors/node"
-NPM_REGISTRY="https://registry.npmmirror.com"
-TERMUX_REPO="https://packages.termux.dev/apt/termux-main"
-UBUNTU_ARCHIVE_AMD64="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"        # InRelease verified with gpgv
-UBUNTU_ARCHIVE_ARM64="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
+# Mirrors default to the China-friendly ones. Every one of them is overridable, because a
+# builder outside China (CI) reaches the upstreams far faster, and the sha256 pins below
+# make the mirror a pure transport choice: the bytes are identical either way.
+UBUNTU_MIRROR="${UBUNTU_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release}"
+NODE_MIRROR="${NODE_MIRROR:-https://npmmirror.com/mirrors/node}"
+NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
+TERMUX_REPO="${TERMUX_REPO:-https://packages.termux.dev/apt/termux-main}"
+UBUNTU_ARCHIVE_AMD64="${UBUNTU_ARCHIVE_AMD64:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu}"   # InRelease verified with gpgv
+UBUNTU_ARCHIVE_ARM64="${UBUNTU_ARCHIVE_ARM64:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports}"
 PBS_OFFICIAL="https://github.com/astral-sh/python-build-standalone/releases/download"
 PBS_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
 
@@ -236,6 +239,11 @@ npm_prefix_flags() {  # $1 = npm cpu, $2 = prefix dir; sets the caller's npm_fla
   npm_flags=(
     --prefix "$2" --cpu="$1" --os=linux --libc=glibc
     --registry="$NPM_REGISTRY" --cache "$CACHE/npm"
+    # The lockfile's `resolved` URLs name the mirror they were pinned from. Without this npm
+    # ignores --registry and still fetches them, so a build on another network cannot switch.
+    # With it the host is rewritten to --registry and the lockfile's integrity check still
+    # decides whether the bytes are right.
+    --replace-registry-host=always
     --userconfig "$WORK/empty-user-npmrc" --globalconfig "$WORK/empty-global-npmrc"
     --ignore-scripts --no-audit --no-fund --update-notifier=false --loglevel=warn
   )
@@ -395,6 +403,32 @@ PYEOF
   local pnpm_prefix="$work/pnpm-prefix"
   install_pnpm "$npm_cpu" "$pnpm_prefix"
 
+  # -- extra plugins baked in from outside the repo (EXTRA_PLUGINS, `id=path` entries) --
+  # Each one is mounted at /opt/dsh-go/plugins/<id> and gets an overlay row, exactly like the
+  # bridge: DSH loads it by path, so it never has to be installed into a profile.
+  local plugin_json='[]'
+  local -a plugin_flags=()
+  if [[ -n "${EXTRA_PLUGINS// /}" ]]; then
+    local entry pid ppath
+    for entry in $EXTRA_PLUGINS; do
+      pid="${entry%%=*}"; ppath="${entry#*=}"
+      [[ -d "$ppath" ]] || die "EXTRA_PLUGINS: $pid has no directory at $ppath"
+      plugin_flags+=(--plugin "$pid=$ppath")
+    done
+    plugin_json="$(EXTRA_PLUGINS="$EXTRA_PLUGINS" python3 -I -c '
+import json, os
+rows = []
+for entry in os.environ["EXTRA_PLUGINS"].split():
+    pid, _, path = entry.partition("=")
+    with open(os.path.join(path, "package.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    rows.append({"id": pid, "package": meta.get("name"), "version": meta.get("version"),
+                 "mount": "/opt/dsh-go/plugins/" + pid})
+print(json.dumps(sorted(rows, key=lambda r: r["id"]), ensure_ascii=False))
+')"
+    log "extra plugins: $plugin_json"
+  fi
+
   # -- runtimeVersion: hash of every input + the recipe itself --
   local lockfile="$LOCKS/dsh-$DSH_VERSION/package-lock.json"
   local pnpm_lockfile="$LOCKS/pnpm-$PNPM_VERSION/package-lock.json"
@@ -404,13 +438,14 @@ PYEOF
       sha256 "$base"; sha256 "$node"; sha256 "$python"; sha256sum "${extra_debs[@]}" | cut -d' ' -f1
       sha256 "$proot_deb"; sha256 "$talloc_deb"; sha256 "$shmem_deb"
       sha256 "$lockfile"; sha256 "$pnpm_lockfile"; sha256 "$HERE/build-runtime.sh"; sha256 "$HERE/lib/rtbuild.py"
+      printf '%s' "$plugin_json" | sha256sum | cut -d' ' -f1
       (cd "$HERE" && find patches bridge boot direct -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum)
     } | sha256sum | cut -c1-12 )"
   local runtime_version="${RUNTIME_REVISION}-dsh${DSH_VERSION}-node${NODE_VERSION}-ubuntu${UBUNTU_VERSION}-${inputs_sha}"
   local runtime_info
-  runtime_info="$(printf '{"runtimeVersion":"%s","abi":"%s","dshVersion":"%s","nodeVersion":"%s","pnpmVersion":"%s","ubuntuVersion":"%s","prootVersion":"%s","dshPatches":%s,"dshGoBridge":"%s"}' \
+  runtime_info="$(printf '{"runtimeVersion":"%s","abi":"%s","dshVersion":"%s","nodeVersion":"%s","pnpmVersion":"%s","ubuntuVersion":"%s","prootVersion":"%s","dshPatches":%s,"dshGoBridge":"%s","extraPlugins":%s}' \
     "$runtime_version" "$abi" "$DSH_VERSION" "$NODE_VERSION" "$PNPM_VERSION" "$UBUNTU_VERSION" "$PROOT_VERSION" \
-    "$(cat "$work/dsh-patches.json")" "$bridge_version")"
+    "$(cat "$work/dsh-patches.json")" "$bridge_version" "$plugin_json")"
 
   # -- rootfs archive --
   local archive="$assets/rootfs-$abi.tar.$COMPRESS"
@@ -419,7 +454,7 @@ PYEOF
   "${PY[@]}" assemble --abi "$abi" --base "$base" --node "$node" --dsh-prefix "$prefix" --pnpm-prefix "$pnpm_prefix" \
     --out "$archive" --report "$out/build-report.json" --runtime-info "$runtime_info" \
     --compress "$COMPRESS" --xz-preset "$XZ_PRESET" --threads "$XZ_THREADS" --epoch "$SOURCE_DATE_EPOCH" "${prune[@]}" \
-    "${extra_debs[@]/#/--deb=}" --python "$python" --bridge "$bridge"
+    "${extra_debs[@]/#/--deb=}" --python "$python" --bridge "$bridge" "${plugin_flags[@]}"
 
   local versions
   versions="$(printf '{"runtimeVersion":"%s","dshVersion":"%s","nodeVersion":"%s","pnpmVersion":"%s","ubuntuVersion":"%s","prootVersion":"%s","tallocVersion":"%s","androidShmemVersion":"%s","dshPatches":%s,"dshGoBridge":"%s","build":{"inputsSha256_12":"%s","ubuntuBaseSha256":"%s","nodeSha256":"%s","dshLockSha256":"%s","pnpmIntegrity":"%s","sourceDateEpoch":%s}}' \

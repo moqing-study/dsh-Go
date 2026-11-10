@@ -1,0 +1,276 @@
+# Notara 集成版 dsh-Go 的云端构建。
+#
+# 本地（国内网络）连不上 dl.google.com / plugins.gradle.org / Flutter CDN，Gradle 反复超时，
+# 所以整条重活链——rootfs 组装 + APK 编译签名——全部放在 GitHub 官方的 ubuntu runner 上跑：
+# 海外带宽直连上游源，16GB 内存，Android SDK / JDK 17 预装。
+#
+# 两个 job 拆开是因为它们的耗时差了一个数量级，而且 rootfs 只跟 runtime/ 与 Notara 的提交有关：
+#   runtime  组装 rootfs（注入 Notara 插件、改 dsh-web.patch.yml、重算 manifest），产物缓存
+#   apk      取 rootfs，签密钥，tooling/build-apk.sh -f arm64，上传 artifact + 发 Release
+#
+# 只改 Flutter UI 时 runtime 缓存命中，跳过 40 分钟的 rootfs，直接进 APK 编译。
+name: Build Notara APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 构建成功后发一个 GitHub Release
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: notara-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  NODE_VERSION: 24.22.1
+  TZ: Asia/Shanghai
+  # 云端用上游官方源：runner 在海外，镜像反而是绕路。sha256 pin 保证换个镜像也是同一批字节。
+  UBUNTU_MIRROR: https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release
+  NODE_MIRROR: https://nodejs.org/dist
+  NPM_REGISTRY: https://registry.npmjs.org
+  UBUNTU_ARCHIVE_AMD64: http://archive.ubuntu.com/ubuntu
+  UBUNTU_ARCHIVE_ARM64: http://ports.ubuntu.com/ubuntu-ports
+  # Notara 教学引擎：未发布到 npm，只能从源码取。钉死提交，保证可复现。
+  NOTARA_REPO: https://github.com/TongZi2003/Notara.git
+  NOTARA_REF: 09a73bb749fe1f452ca53acdbf73fcc4b9704692
+  NOTARA_PLUGIN_SRC: examples/native-vault
+
+jobs:
+  runtime:
+    name: Runtime rootfs (arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # 标准 runner 只有 14GB 空盘，rootfs 的工作目录 + xz 归档 + Gradle 缓存会顶到边。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Host tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils file gpgv
+
+      - name: Cache runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: runtime/.cache
+          key: runtime-cache-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/locks/**') }}
+          restore-keys: runtime-cache-${{ env.NOTARA_REF }}-
+
+      # rootfs 是可复现的（SOURCE_DATE_EPOCH 固定、依赖全部 pin 死），所以按配方内容做键。
+      # 只改 Flutter UI 时这个键不变，整个 rootfs 组装直接跳过。
+      - name: Restore the built rootfs
+        id: rootfs
+        uses: actions/cache@v4
+        with:
+          path: |
+            runtime/out/arm64-v8a
+            runtime/out/manifest.json
+          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}
+
+      - name: Fetch the Notara teaching engine
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init -q notara && cd notara
+          git remote add origin "$NOTARA_REPO"
+          # 只取需要的那个提交；--depth 1 对任意 sha 不生效，所以先浅取全部分支再 fetch 目标
+          git fetch -q --depth 1 origin "$NOTARA_REF"
+          git checkout -q FETCH_HEAD
+          echo "Notara commit: $(git rev-parse HEAD)"
+
+      - name: Stage the plugin and install its arm64 dependencies
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/plugin"
+          # 插件是 Notara 仓库里的一个 workspace 包，源码就是最终产物（不用编译），
+          # package.json 里 10 个依赖都写死了版本，没有 workspace: 协议，可以独立装。
+          cp -a "notara/$NOTARA_PLUGIN_SRC/." "$RUNNER_TEMP/plugin/"
+          rm -f "$RUNNER_TEMP"/plugin/*.test.js
+          cd "$RUNNER_TEMP/plugin"
+          # --os/--cpu/--libc：在 x64 runner 上装出 arm64 Android 能用的树（原生 .node 必须是 aarch64）
+          npm install --ignore-scripts --no-audit --no-fund --engine-strict=false \
+            --os=linux --cpu=arm64 --libc=glibc --omit=dev
+          echo "packages: $(ls node_modules | wc -l), size: $(du -sh node_modules | cut -f1)"
+          # 装出来的原生模块必须是 aarch64，否则装进手机也跑不起来
+          bad=0
+          while IFS= read -r f; do
+            file -b "$f" | grep -q aarch64 || { echo "not arm64: $f ($(file -b "$f"))"; bad=1; }
+          done < <(find node_modules -name '*.node' -type f)
+          [[ $bad == 0 ]] || exit 1
+          echo "plugin: $(du -sh . | cut -f1)"
+
+      - name: Assemble the rootfs
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        env:
+          EXTRA_PLUGINS: notara-vault-native=${{ runner.temp }}/plugin
+          XZ_THREADS: 4
+        run: |
+          set -euo pipefail
+          bash runtime/build-runtime.sh arm64-v8a
+          echo "--- result ---"
+          ls -lh runtime/out/arm64-v8a/assets/runtime/
+          python3 - <<'PY'
+          import json
+          m = json.load(open("runtime/out/arm64-v8a/assets/runtime/manifest.json"))
+          print("runtimeVersion:", m["runtimeVersion"])
+          print("rootfs:", m["rootfs"], m["rootfsBytes"], "bytes")
+          print("extraPlugins:", m.get("extraPlugins"))
+          PY
+
+      - name: Check the plugin really made it into the rootfs
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tar -tJf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+            | grep -E '^\.?/?opt/dsh-go/plugins/notara-vault-native/(index\.js|package\.json)$'
+          tar -xJOf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+            ./etc/dsh-app/dsh-web.patch.yml 2>/dev/null || \
+          tar -xJOf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+            etc/dsh-app/dsh-web.patch.yml
+          echo "--- manifest 里必须写着这个版本 ---"
+          grep -o '"extraPlugins":[^]]*]' runtime/out/arm64-v8a/assets/runtime/manifest.json || true
+
+      - name: Upload the rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-arm64
+          path: |
+            runtime/out/arm64-v8a
+            runtime/out/manifest.json
+          retention-days: 14
+          compression-level: 0
+
+  apk:
+    name: APK (arm64, release, signed)
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      DSH_MAVEN_MIRRORS: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          df -h /
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-arm64
+          path: runtime/out
+
+      - name: Restore the release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.NOTARA_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.NOTARA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NOTARA_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.NOTARA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_B64" | base64 -d > app/android/notara-release.jks
+          chmod 600 app/android/notara-release.jks
+          # Gradle 从 app/android/app/ 解析这个相对路径，指向 app/android/notara-release.jks
+          {
+            echo "storeFile=../notara-release.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > app/android/key.properties
+          chmod 600 app/android/key.properties
+          keytool -list -keystore app/android/notara-release.jks -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" | sed -n '1,6p'
+
+      - name: Cache Gradle and pub
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: gradle-${{ env.FLUTTER_VERSION }}-${{ hashFiles('app/pubspec.lock', 'app/android/**/*.kts', 'app/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ env.FLUTTER_VERSION }}-
+
+      - name: Flutter dependencies
+        working-directory: app
+        run: |
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - name: Build the signed APK
+        run: |
+          set -euo pipefail
+          echo "rootfs in place: $(du -sh runtime/out/arm64-v8a | cut -f1)"
+          bash tooling/build-apk.sh -f arm64 --keep-daemon
+          ls -lh app/build/app/outputs/flutter-apk/
+
+      - name: Rename for the release
+        id: apk
+        run: |
+          set -euo pipefail
+          src=app/build/app/outputs/flutter-apk/app-arm64-release.apk
+          [[ -f $src ]] || { echo "no APK at $src"; ls -R app/build/app/outputs || true; exit 1; }
+          version=$(sed -n 's/^version:[[:space:]]*\([^+[:space:]]*\).*/\1/p' app/pubspec.yaml)
+          out="dsh-go-notara-${version}-arm64.apk"
+          cp "$src" "$out"
+          echo "size=$(du -h "$out" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "name=$out" >> "$GITHUB_OUTPUT"
+          echo "$out  ($(du -h "$out" | cut -f1))"
+
+      - name: Verify the signature scheme and the bundled runtime
+        run: |
+          set -euo pipefail
+          apksigner=$(ls -1d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          "$apksigner" verify --print-certs "${{ steps.apk.outputs.name }}" | sed -n '1,8p'
+          unzip -l "${{ steps.apk.outputs.name }}" | grep -E 'assets/runtime/(rootfs|manifest)' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-notara-apk
+          path: ${{ steps.apk.outputs.name }}
+          retention-days: 30
+          compression-level: 0
+
+      - name: Release
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: notara-${{ github.run_number }}
+          name: dsh-Go Notara 集成版 ${{ github.run_number }}
+          body: |
+            内置 Notara 教学引擎（白板 / 教室 / 课堂 / Vault）的 dsh-Go 安装包。
+
+            - 架构：arm64-v8a（手机）
+            - 签名：固定 release 密钥，可直接覆盖安装后续构建
+            - Notara 提交：`${{ env.NOTARA_REF }}`
+            - runtime：见构建日志里的 `runtimeVersion`
+          files: ${{ steps.apk.outputs.name }}
+          fail_on_unmatched_files: true
