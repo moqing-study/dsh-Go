@@ -68,6 +68,10 @@ UBUNTU_ARCHIVE_ARM64="${UBUNTU_ARCHIVE_ARM64:-https://mirrors.tuna.tsinghua.edu.
 # Security uploads land in their own pool and reach the archive mirrors later; a build that
 # only asks the archive 404s on a package the index already lists.
 UBUNTU_SECURITY_ARCHIVE="${UBUNTU_SECURITY_ARCHIVE:-https://security.ubuntu.com/ubuntu}"
+# Last-resort pools. Ubuntu keeps one copy of a package in pool/ and drops the rest, so the
+# only copy of a security upload may sit on hosts that sync security into their main tree.
+# These are mirrors, not sources of truth: every byte still has to match the signed index.
+UBUNTU_EXTRA_POOLS="${UBUNTU_EXTRA_POOLS:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu https://mirrors.aliyun.com/ubuntu}"
 PBS_OFFICIAL="https://github.com/astral-sh/python-build-standalone/releases/download"
 PBS_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
 
@@ -144,12 +148,19 @@ pin_of() {
 fetch_any() {
   local dest="$1" want="$2"; shift 2
   if [[ -f "$dest" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
-  local url got
+  local url got code
   for url in "$@"; do
-    if curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -sS -o "$dest.part" "$url" 2>/dev/null; then
+    # No -f: the status code is the diagnostic. "404 on every host" and "200 with the
+    # wrong bytes" are different problems and used to look identical in the log.
+    code="$(curl -L --retry 2 --retry-delay 1 --connect-timeout 20 -sS \
+      -o "$dest.part" -w '%{http_code}' "$url" 2>/dev/null)" || true
+    if [[ "$code" == 200 ]]; then
       got="$(sha256 "$dest.part")"
       if [[ "$got" == "$want" ]]; then mv "$dest.part" "$dest"; return 0; fi
-      log "sha256 mismatch from $url; next mirror"
+      log "  200 but wrong bytes: $url"
+      rm -f "$dest.part"
+    else
+      log "  http ${code:-000}: $url"
       rm -f "$dest.part"
     fi
   done
@@ -295,6 +306,8 @@ PYEOF
     else
       urls+=("$mirror/$file" "$UBUNTU_ARCHIVE_AMD64/$file")
     fi
+    local pool
+    for pool in $UBUNTU_EXTRA_POOLS; do urls+=("$pool/$file"); done
     if ! fetch_any "$CACHE/ubuntu/debs/$name" "$sum" "${urls[@]}"; then
       # The pin rotted: Ubuntu dropped this file from pool/ when a newer one was uploaded.
       local index_arch index_mirror rec newfile newsum
@@ -309,8 +322,10 @@ PYEOF
       while IFS=$'\t' read -r _ newfile newsum _; do
         [[ -n "${newfile:-}" ]] || continue
         name="$(basename "$newfile")"
-        if fetch_any "$CACHE/ubuntu/debs/$name" "$newsum" \
-            "$UBUNTU_SECURITY_ARCHIVE/$newfile" "$UBUNTU_ARCHIVE_AMD64/$newfile" "$mirror/$newfile"; then
+        local -a pool_urls=("$UBUNTU_SECURITY_ARCHIVE/$newfile" "$UBUNTU_ARCHIVE_AMD64/$newfile" "$mirror/$newfile")
+        local pool
+        for pool in $UBUNTU_EXTRA_POOLS; do pool_urls+=("$pool/$newfile"); done
+        if fetch_any "$CACHE/ubuntu/debs/$name" "$newsum" "${pool_urls[@]}"; then
           log "stale pin: $pkg re-resolved to $name"
           ok=1
           break
