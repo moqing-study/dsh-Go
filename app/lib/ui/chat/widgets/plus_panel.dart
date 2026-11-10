@@ -60,6 +60,15 @@ final class GenerateChoice extends PlusChoice {
   const GenerateChoice();
 }
 
+/// 「调用教学技能」: Notara 的教学技能入口。
+///
+/// 它和附件不是一类东西——附件是"给这一轮加点材料",技能是"换一种讲法"。
+/// 所以它排在附件之后、`本对话` 之前,有自己的图标（毕业帽）,不和相册/拍照
+/// 抢同一排的注意力。
+final class TeachingChoice extends PlusChoice {
+  const TeachingChoice();
+}
+
 /// A plugin's tool: the caller runs it, in front of the composer.
 final class NativeToolChoice extends PlusChoice {
   const NativeToolChoice(this.action);
@@ -81,7 +90,13 @@ abstract final class PlusPanelMetrics {
 /// The ＋ panel. [files] false (DSH Remote stages no files) leaves 文件 out;
 /// [generate] adds 生成; [sessionId] adds 本对话 (a new chat has no
 /// conversation to set yet).
-Future<PlusChoice?> showPlusPanel(BuildContext context, {bool files = true, bool generate = false, String? sessionId}) {
+Future<PlusChoice?> showPlusPanel(
+  BuildContext context, {
+  bool files = true,
+  bool generate = false,
+  bool teaching = false,
+  String? sessionId,
+}) {
   return showAppSheet<PlusChoice>(
     context,
     isScrollControlled: true,
@@ -89,7 +104,7 @@ Future<PlusChoice?> showPlusPanel(BuildContext context, {bool files = true, bool
       top: false,
       child: SingleChildScrollView(
         child: SheetNavigator(
-          root: (_) => _PlusRoot(files: files, generate: generate, sessionId: sessionId),
+          root: (_) => _PlusRoot(files: files, generate: generate, teaching: teaching, sessionId: sessionId),
         ),
       ),
     ),
@@ -111,10 +126,11 @@ Future<void> showPermissionSheet(BuildContext context, String sessionId) {
 }
 
 class _PlusRoot extends ConsumerWidget {
-  const _PlusRoot({required this.files, required this.generate, required this.sessionId});
+  const _PlusRoot({required this.files, required this.generate, required this.teaching, required this.sessionId});
 
   final bool files;
   final bool generate;
+  final bool teaching;
   final String? sessionId;
 
   @override
@@ -127,8 +143,7 @@ class _PlusRoot extends ConsumerWidget {
       (AttachChoice(AttachSource.camera), AppIcons.camera, l10n.chatTakePhoto, 2),
       if (files) (AttachChoice(AttachSource.files), AppIcons.files, l10n.chatFile, 4),
       if (generate) (const GenerateChoice(), AppIcons.generateMedia, l10n.mediaGenerateTile, 6),
-    ];
-    return Column(
+    ];    return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -144,6 +159,14 @@ class _PlusRoot extends ConsumerWidget {
             ],
           ),
         ),
+        // 教学技能独占一行:它换的是"怎么讲",和上面四个"加什么材料"不是一类。
+        if (teaching) ...[
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: PlusPanelMetrics.side),
+            child: _TeachingEntry(onTap: () => Navigator.pop(context, const TeachingChoice())),
+          ),
+        ],
         const _PluginTools(),
         if (sessionId != null) ...[const SizedBox(height: 16), _ThisChatCard(sessionId: sessionId)],
         if (phoneOn) ...[const SizedBox(height: 24), const _PhoneCard()],
@@ -154,6 +177,59 @@ class _PlusRoot extends ConsumerWidget {
 }
 
 /// Plugins' tools on the attachment tiles' grid, four to a row; nothing without any.
+/// 「调用教学技能」:一行的入口,不是方块。
+///
+/// 上面那排方块是"给这一轮加点材料"(相册/拍照/文件/生成),这一行是
+/// "换一种讲法"。做成同样的方块会让人以为是第五种附件。
+class _TeachingEntry extends StatelessWidget {
+  const _TeachingEntry({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          onTap();
+        },
+        child: SizedBox(
+          // 56:一行一个动作,热区要够大,又不能让面板长出一截。
+          height: 56,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: Row(
+              children: [
+                Icon(AppIcons.school, size: 22, color: scheme.primary),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text('调用教学技能', style: Theme.of(context).textTheme.bodyMedium),
+                      Text(
+                        '按这个课堂的讲课方式回答',
+                        style: Theme.of(context).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(AppIcons.disclosure, size: 16, color: scheme.onSurfaceVariant),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _PluginTools extends ConsumerWidget {
   const _PluginTools();
 

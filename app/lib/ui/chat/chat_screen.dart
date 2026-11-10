@@ -959,8 +959,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
   // ---------------------------------------------------------------------------
   // 附件
 
-  Future<void> _attach() async {
-    final room = maxAttachments - _drafts.length;
+  /// 「调用教学技能」:在光标处放一句"该怎么讲"的开头,焦点留在输入框,
+  /// 用户接着说要讲什么。
+  ///
+  /// 为什么不直接替他选一个技能:技能目录在 Notara 插件里,原生这层只知道
+  /// "这一轮要按教学的方式回答"。假装选中一个反而会让用户以为已经切了课,
+  /// 结果回答还是默认语气——那比多打半句话糟得多。
+  void _insertTeachingPrompt() {
+    const prompt = '请用这个课堂的教学方式讲解：';
+    final text = _input.text;
+    final selection = _input.selection;
+    final start = selection.isValid ? selection.start : text.length;
+    final end = selection.isValid ? selection.end : text.length;
+    _input.value = TextEditingValue(
+      text: text.replaceRange(start, end, prompt),
+      selection: TextSelection.collapsed(offset: start + prompt.length),
+    );
+    _focus.requestFocus();
+  }
+
+  Future<void> _attach() async {    final room = maxAttachments - _drafts.length;
     final client = ref.read(activeConnectionProvider).value?.client;
     // A draft or connection that changes away and back still retires this pick.
     final scope = _draftScope;
@@ -985,7 +1003,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         files: canStageFiles(ref.read(activeConnectionProvider).value, ref.read(activeHostProvider)),
         sessionId: ref.read(currentSessionProvider),
         generate: ref.read(mediaPluginProvider) != MediaPluginState.absent,
+        // 教学模式下 `+` 多一项「调用教学技能」。
+        teaching: widget.customTopBar,
       );
+      if (choice is TeachingChoice) {
+        if (ownsDraft()) _insertTeachingPrompt();
+        return;
+      }
       if (choice is GenerateChoice) {
         if (ownsDraft()) _enterGenerate();
         return;
