@@ -845,8 +845,15 @@ window.__ModuleLoader__.load({
                   /* 宿主桥不在(浏览器调试)时静默 */
                 }
               };
-              window.addEventListener('notara-board-changed', onChanged as EventListener);
-              return () => window.removeEventListener('notara-board-changed', onChanged as EventListener);
+              // 白板在流式生成时由 board-stream.js 发 `notara-board-stream`
+              // (带 sessionId),落盘后的文件变更也会发 vault-changed;两个都听,
+              // 前者保证"老师正在画"就能亮点,后者兜住直接改文件的路径。
+              window.addEventListener('notara-board-stream', onChanged as EventListener);
+              window.addEventListener('notara-vault-changed', onChanged as EventListener);
+              return () => {
+                window.removeEventListener('notara-board-stream', onChanged as EventListener);
+                window.removeEventListener('notara-vault-changed', onChanged as EventListener);
+              };
             }, 'notara-vault-native: board notify');
             // The rail is 56px; the panel gets the rest of a 360px sidebar by default.
             scope.layout.setSidebarDefaultWidth?.(360);
