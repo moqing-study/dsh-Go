@@ -391,25 +391,28 @@ jobs:
           name: runtime-arm64
           path: runtime/out
 
-      - name: Restore the release keystore
+      - name: Restore the coexist keystore
         env:
-          KEYSTORE_B64: ${{ secrets.NOTARA_KEYSTORE_B64 }}
-          STORE_PASSWORD: ${{ secrets.NOTARA_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.NOTARA_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.NOTARA_KEY_PASSWORD }}
+          KEYSTORE_B64: ${{ secrets.NOTARA_COEXIST_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.NOTARA_COEXIST_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NOTARA_COEXIST_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.NOTARA_COEXIST_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          printf '%s' "$KEYSTORE_B64" | base64 -d > app/android/notara-release.jks
-          chmod 600 app/android/notara-release.jks
-          # Gradle 从 app/android/app/ 解析这个相对路径，指向 app/android/notara-release.jks
+          if [[ -z "$KEYSTORE_B64" ]]; then
+            echo "Secret NOTARA_COEXIST_KEYSTORE_B64 is not set — cannot sign the coexist APK"; exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > app/android/notara-coexist.jks
+          chmod 600 app/android/notara-coexist.jks
+          # Gradle 从 app/android/app/ 解析这个相对路径，指向 app/android/notara-coexist.jks
           {
-            echo "storeFile=../notara-release.jks"
+            echo "storeFile=../notara-coexist.jks"
             echo "storePassword=$STORE_PASSWORD"
             echo "keyAlias=$KEY_ALIAS"
             echo "keyPassword=$KEY_PASSWORD"
           } > app/android/key.properties
           chmod 600 app/android/key.properties
-          keytool -list -keystore app/android/notara-release.jks -storepass "$STORE_PASSWORD" \
+          keytool -list -keystore app/android/notara-coexist.jks -storepass "$STORE_PASSWORD" \
             -alias "$KEY_ALIAS" | sed -n '1,6p'
 
       - name: Cache Gradle and pub

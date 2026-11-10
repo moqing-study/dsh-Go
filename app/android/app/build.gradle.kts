@@ -43,7 +43,10 @@ android {
     }
 
     defaultConfig {
-        applicationId = "io.github.ccch1mneyyy.dsh_app"
+        // Coexists with the upstream app: a different applicationId (+ notara
+        // suffix) installs alongside it instead of replacing it. The namespace
+        // above stays the original package, so Kotlin sources need no changes.
+        applicationId = "io.github.ccch1mneyyy.dsh_app.notara"
         // java.nio.file (symlinks while unpacking the rootfs) needs API 26.
         minSdk = 26
         // Target 28 like Termux, so the API 29+ exec restriction on app-private
