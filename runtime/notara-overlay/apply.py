@@ -147,28 +147,77 @@ def overlay_digest(dest: str) -> str:
 
 
 def pack(dest: str, out: str, threads: int) -> None:
-    """按原归档同样的规矩重打:GNU tar、名字相对、排序父子在前。"""
-    entries: list[str] = []
-    for base, dirs, files in os.walk(dest):
-        dirs.sort()
-        for name in sorted(dirs) + sorted(files):
-            full = os.path.join(base, name)
-            entries.append(os.path.relpath(full, dest))
-    entries.sort(key=lambda p: (p.count(os.sep), p))
+    """按原归档同样的规矩重打:GNU tar、名字相对、排序父子在前。
+
+    **只能把 "." 交给 tar,让它自己递归一次。** 早先这里是"先 os.walk 收集每
+    个子目录和文件,再一并塞进 tar 参数",于是同一个 inode 被归档了三遍:顶层
+    目录递归一次、父目录再递归一次、文件本身又列一次。后两遍 GNU tar 写成
+    `hrw... usr/bin/env link to usr/bin/env` —— **指向自己的硬链接**。
+
+    Android 的解压器解到自指硬链接时,会先把刚写好的目标删掉再 link,而
+    link 的目标就是它自己,于是文件凭空消失。表现就是 proot 启动直接报
+    `/usr/bin/env not found`,一两秒退出,日志里只剩 "引擎被系统结束了"。
+    """
     run(["tar", "--sort=name", "--owner=0", "--group=0", "--numeric-owner",
-         "-cf", out + ".tar", "-C", dest] + entries)
+         "-cf", out + ".tar", "-C", dest, "."])
     run(["xz", "-T%d" % threads, "-6", "-f", out + ".tar"])
     os.replace(out + ".tar.xz", out)
 
 
-def verify(rootfs: str) -> None:
+# 这些东西一个都不能少。少了 proot 连第一行都跑不起来,而安装器只按 manifest
+# 校验压缩包的 sha256,包坏了它一样报"安装成功"。
+REQUIRED_FILES = (
+    "usr/bin/env",        # proot 的第一个参数;少了直接 "not found" 退出
+    "usr/bin/sh",         # 启动命令的 shell
+    "usr/local/bin/dsh",  # 引擎本体
+    "etc/group",          # 安装器要读它建 uid->gid 映射,读不到就 skipped
+)
+
+# 正常 rootfs 约 8 万条目(含目录和符号链接)。超过这个数说明又出现了重复归档。
+MAX_MEMBERS = 120_000
+
+
+def verify(rootfs: str) -> int:
+    """把刚写出的归档当成"别人会怎么解"来验,返回解压后字节数。"""
     with tarfile.open(rootfs, "r:xz") as tar:
-        names = set(tar.getnames())
+        members = tar.getmembers()
+        names = {m.name.removeprefix("./") for m in members}
+
+        # 1. 自指硬链接。这是上一次真机翻车的直接原因:Android 解压器先把目标
+        #    删掉再 link,目标又是它自己,文件就没了。
+        self_linked = [
+            m.name for m in members
+            if m.islnk() and m.linkname.removeprefix("./") == m.name.removeprefix("./")
+        ]
+        if self_linked:
+            sys.exit(
+                "归档畸形:%d 个自指硬链接,例如 %s。Android 解压后这些文件会消失。"
+                % (len(self_linked), self_linked[:3])
+            )
+
+        # 2. 条目数。重复归档会让这个数字成倍膨胀,是上面那种畸形的前兆。
+        if len(members) > MAX_MEMBERS:
+            sys.exit(
+                "归档条目数异常:%d(正常约 8 万),疑似同一个文件被归档多次。"
+                % len(members)
+            )
+
+        # 3. 引擎真正依赖的文件,一个都不能缺。
+        for path in REQUIRED_FILES:
+            if path not in names:
+                sys.exit("归档缺文件:%s(proot 会直接启动失败)" % path)
+
+        # 4. 不能是空壳:env 必须是可执行的 ELF。
+        handle = tar.extractfile("usr/bin/env")
+        head = handle.read(4) if handle else b""
+        if head != b"\x7fELF":
+            sys.exit("usr/bin/env 不是 ELF 可执行文件(前 4 字节 %r)" % head)
 
         def read(path: str) -> str:
             member = tar.extractfile(path)
             return member.read().decode("utf-8", "replace") if member else ""
 
+        # 5. 改动内容自证。
         missing = 0
         for path, needle in MARKERS:
             if path not in names:
@@ -180,6 +229,8 @@ def verify(rootfs: str) -> None:
                 missing = 1
         if missing:
             sys.exit("overlay 自检失败:改动没有真的进归档")
+
+        return sum(m.size for m in members if m.isfile())
 
 
 def main() -> None:
@@ -212,11 +263,15 @@ def main() -> None:
         os.replace(out, args.rootfs)
         shutil.rmtree(staging, ignore_errors=True)
 
+    # 先验归档,再写 manifest:包不合格就不该留下一个"看起来装好了"的版本号。
+    uncompressed = verify(args.rootfs)
+
     with open(args.manifest, encoding="utf-8") as fh:
         manifest = json.load(fh)
     manifest["runtimeVersion"] = version
     manifest["rootfsBytes"] = size
     manifest["rootfsSha256"] = sha.hexdigest()
+    manifest["uncompressedBytes"] = uncompressed
     manifest["notaraOverlay"] = {
         "version": version,
         "base": base,
@@ -227,8 +282,7 @@ def main() -> None:
         fh.write("\n")
     print("manifest updated: %s" % version, flush=True)
 
-    verify(args.rootfs)
-    print("overlay ok", flush=True)
+    print("overlay ok, uncompressed %d bytes" % uncompressed, flush=True)
 
 
 if __name__ == "__main__":
