@@ -177,6 +177,44 @@ termux_deb() {  # $1 = package, $2 = version, $3 = termux arch; echoes path
   printf '%s' "$dest"
 }
 
+# Re-resolve a package whose pinned pool file has vanished from every mirror.
+# Ubuntu deletes a superseded .deb from pool/ as soon as a newer upload lands in the same
+# suite, so a lockfile that pins a filename byte for byte starts 404ing months later -- which
+# is exactly how the first green cloud run died (ca-certificates 20260816ubuntu0.24.04.1_all
+# was gone from both archive and ports). Re-pinning by hand only postpones the same failure,
+# so ask the signed indexes for the current file instead: InRelease -> gpgv -> Packages.xz ->
+# deb, the same chain of trust as the initial resolve. We stop pretending that a mutable pool
+# is immutable; the archive keyring still vouches for the bytes.
+# Echoes "<package>\t<filename>\t<sha256>\t<version>".
+ubuntu_repin() {  # $1 = mirror, $2 = index arch, $3 = base tarball, $4... = package names
+  local mirror="$1" index_arch="$2" base="$3"; shift 3
+  command -v gpgv >/dev/null || die "gpgv is required to re-resolve a stale pin"
+  local dir="$CACHE/ubuntu/repin-$index_arch"; mkdir -p "$dir"
+  if [[ ! -f "$dir/archive-keyring.gpg" ]]; then
+    python3 -I - "$base" "$dir/archive-keyring.gpg" <<'PYEOF'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as t:
+    for m in t:
+        if m.name.lstrip("./") == "usr/share/keyrings/ubuntu-archive-keyring.gpg":
+            open(sys.argv[2], "wb").write(t.extractfile(m).read()); break
+    else:
+        sys.exit("keyring not found in base tarball")
+PYEOF
+  fi
+  local -a idx=() pkgs=(); local suite want p
+  for p in "$@"; do pkgs+=(--package "$p"); done
+  for suite in noble noble-updates noble-security; do
+    fetch "$mirror/dists/$suite/InRelease" "$dir/$suite.InRelease"
+    gpgv --keyring "$dir/archive-keyring.gpg" "$dir/$suite.InRelease" 2>/dev/null \
+      || die "InRelease signature check failed for $suite while re-pinning"
+    want="$(awk -v f="main/binary-$index_arch/Packages.xz" '/^SHA256:/{s=1;next} /^[A-Za-z]/{s=0} s && $3==f {print $1}' "$dir/$suite.InRelease")"
+    [[ -n "$want" ]] || die "no Packages.xz hash for $suite/$index_arch"
+    fetch "$mirror/dists/$suite/main/binary-$index_arch/Packages.xz" "$dir/$suite.Packages.xz" "$want"
+    idx+=(--packages "$dir/$suite.Packages.xz")
+  done
+  "${PY[@]}" repin --arch "$index_arch" "${idx[@]}" "${pkgs[@]}"
+}
+
 # Extra Ubuntu noble packages (tzdata, ca-certificates, git and their dependency closure).
 # Chain of trust: InRelease of noble / noble-updates / noble-security verified with gpgv against
 # ubuntu-archive-keyring.gpg from the checksum-verified Ubuntu Base tarball -> Packages.xz hash
@@ -212,8 +250,8 @@ PYEOF
     # shellcheck disable=SC2086
     "${PY[@]}" resolve-debs --base "$base" --arch "$arch" "${idx[@]}" --want $UBUNTU_EXTRA --out "$lock" >&2
   fi
-  local name file sum arch_of
-  while read -r file sum arch_of; do
+  local name file sum arch_of pkg
+  while IFS=$'\t' read -r pkg file sum arch_of; do
     name="$(basename "$file")"
     # Architecture: all lives in the primary archive only; the ports mirror has just the
     # ports architectures. Both are tried either way, sha256 decides.
@@ -223,10 +261,22 @@ PYEOF
     else
       urls+=("$mirror/$file" "$UBUNTU_ARCHIVE_AMD64/$file")
     fi
-    fetch_any "$CACHE/ubuntu/debs/$name" "$sum" "${urls[@]}" \
-      || die "no mirror serves $name with sha256 $sum"
+    if ! fetch_any "$CACHE/ubuntu/debs/$name" "$sum" "${urls[@]}"; then
+      # The pin rotted: Ubuntu dropped this file from pool/ when a newer one was uploaded.
+      local index_arch index_mirror rec newfile newsum
+      [[ "$arch_of" == all ]] && index_arch=amd64 || index_arch="$arch"
+      [[ "$index_arch" == amd64 ]] && index_mirror="$UBUNTU_ARCHIVE_AMD64" || index_mirror="$mirror"
+      rec="$(ubuntu_repin "$index_mirror" "$index_arch" "$base" "$pkg")" \
+        || die "no mirror serves $name and the index no longer lists $pkg"
+      IFS=$'\t' read -r _ newfile newsum _ <<<"$rec"
+      name="$(basename "$newfile")"
+      log "stale pin: $pkg re-resolved to $name"
+      fetch_any "$CACHE/ubuntu/debs/$name" "$newsum" \
+        "$UBUNTU_ARCHIVE_AMD64/$newfile" "$mirror/$newfile" \
+        || die "index names $newfile but no mirror serves those bytes"
+    fi
     printf '%s\n' "$CACHE/ubuntu/debs/$name"
-  done < <(python3 -I -c 'import json,sys; [print(p["filename"], p["sha256"], p["architecture"]) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")
+  done < <(python3 -I -c 'import json,sys; [print("\t".join((p["package"], p["filename"], p["sha256"], p["architecture"]))) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")
 }
 
 # Relocatable CPython (python-build-standalone, install_only_stripped). Checksums come from the

@@ -532,6 +532,38 @@ def base_status(base_tar):
     raise SystemExit("no dpkg status in " + base_tar)
 
 
+def cmd_repin(args):
+    """Re-resolve a stale lockfile pin against the current signed indexes.
+
+    A lockfile records pool filenames byte for byte, but Ubuntu removes a superseded
+    .deb from pool/ as soon as a newer upload lands in the same suite. The pin then
+    404s on every mirror, which is a build failure caused by nothing in this repo.
+    Prints "<package>\\t<filename>\\t<sha256>\\t<version>", one line per requested
+    package, picking the highest version the indexes offer.
+    """
+    wanted = set(args.package)
+    best = {}
+    for path in args.packages:
+        with open(path, "rb") as f:
+            raw = f.read()
+        text = (lzma.decompress(raw) if path.endswith(".xz") else raw).decode()
+        for s in parse_stanzas(text):
+            if s.get("Package") not in wanted or s.get("Architecture") not in (args.arch, "all"):
+                continue
+            cur = best.get(s["Package"])
+            if cur is None or debver_cmp(s["Version"], cur["Version"]) > 0:
+                best[s["Package"]] = s
+    missing = sorted(wanted - set(best))
+    if missing:
+        raise SystemExit("repin: no index entry for " + ", ".join(missing))
+    for name in sorted(best):
+        s = best[name]
+        for field in ("Filename", "SHA256"):
+            if not s.get(field):
+                raise SystemExit("repin: index entry for %s has no %s" % (name, field))
+        print("\t".join((name, s["Filename"], s["SHA256"], s["Version"])))
+
+
 def cmd_resolve_debs(args):
     arch = args.arch
     installed = {s["Package"]: s for s in base_status(args.base)
@@ -1557,6 +1589,12 @@ def main():
     p.add_argument("--want", nargs="+", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_resolve_debs)
+
+    p = sub.add_parser("repin")
+    p.add_argument("--arch", required=True)
+    p.add_argument("--packages", action="append", required=True)
+    p.add_argument("--package", action="append", required=True)
+    p.set_defaults(fn=cmd_repin)
 
     p = sub.add_parser("hoist-candidates")
     p.add_argument("lock")
