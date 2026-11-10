@@ -113,6 +113,24 @@ fetch() {
   fi
 }
 
+# fetch_try URL DEST [expected-sha256]: like fetch, but a bad copy is a return code, not a
+# death. For optional inputs -- a mirror that serves an index inconsistent with its own
+# InRelease (or an HTML error page) should cost us that one source, not the whole build.
+fetch_try() {
+  local url="$1" dest="$2" want="${3:-}"
+  mkdir -p "$(dirname "$dest")"
+  if [[ -f "$dest" && -n "$want" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
+  rm -f "$dest"
+  log "download $url"
+  curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -sS -o "$dest.part" "$url" \
+    || { rm -f "$dest.part"; return 1; }
+  if [[ -n "$want" && "$(sha256 "$dest.part")" != "$want" ]]; then
+    rm -f "$dest.part"
+    return 1
+  fi
+  mv "$dest.part" "$dest"
+}
+
 pin_of() {
   local name="$1"
   if [[ -n "${PIN[$name]:-}" ]]; then printf '%s' "${PIN[$name]}"; fi
@@ -204,17 +222,30 @@ with tarfile.open(sys.argv[1], "r:gz") as t:
         sys.exit("keyring not found in base tarball")
 PYEOF
   fi
-  local -a idx=() pkgs=(); local suite want p
+  local -a idx=() pkgs=(); local suite want p base_url usable=0
   for p in "$@"; do pkgs+=(--package "$p"); done
   for suite in noble noble-updates noble-security; do
-    fetch "$mirror/dists/$suite/InRelease" "$dir/$suite.InRelease"
-    gpgv --keyring "$dir/archive-keyring.gpg" "$dir/$suite.InRelease" 2>/dev/null \
-      || die "InRelease signature check failed for $suite while re-pinning"
+    # Security metadata belongs to the security host. Asking the archive for it gets a copy
+    # that disagrees with the Packages file it comes with (or an HTML error page), which is
+    # exactly how this path died the first time it ran.
+    [[ "$suite" == noble-security ]] && base_url="$UBUNTU_SECURITY_ARCHIVE" || base_url="$mirror"
+    if ! fetch_try "$base_url/dists/$suite/InRelease" "$dir/$suite.InRelease"; then
+      log "  $suite: no InRelease from $base_url; working without it"
+      continue
+    fi
+    gpgv --keyring "$dir/archive-keyring.gpg" "$dir/$suite.InRelease" 2>/dev/null || {
+      log "  $suite: InRelease failed its signature check; working without it"
+      continue
+    }
     want="$(awk -v f="main/binary-$index_arch/Packages.xz" '/^SHA256:/{s=1;next} /^[A-Za-z]/{s=0} s && $3==f {print $1}' "$dir/$suite.InRelease")"
-    [[ -n "$want" ]] || die "no Packages.xz hash for $suite/$index_arch"
-    fetch "$mirror/dists/$suite/main/binary-$index_arch/Packages.xz" "$dir/$suite.Packages.xz" "$want"
-    idx+=(--packages "$dir/$suite.Packages.xz")
+    [[ -n "$want" ]] || { log "  $suite: no Packages.xz hash for $index_arch"; continue; }
+    if ! fetch_try "$base_url/dists/$suite/main/binary-$index_arch/Packages.xz" "$dir/$suite.Packages.xz" "$want"; then
+      log "  $suite: Packages.xz does not match its InRelease; working without it"
+      continue
+    fi
+    idx+=(--packages "$dir/$suite.Packages.xz"); usable=1
   done
+  [[ "$usable" == 1 ]] || die "no verifiable Ubuntu index for $index_arch while re-pinning $*"
   "${PY[@]}" repin --arch "$index_arch" "${idx[@]}" "${pkgs[@]}"
 }
 
