@@ -147,17 +147,26 @@ pin_of() {
 # so trying more than one host cannot smuggle in different bytes.
 fetch_any() {
   local dest="$1" want="$2"; shift 2
+  mkdir -p "$(dirname "$dest")"
   if [[ -f "$dest" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
-  local url got code
+  local url got code rc
   for url in "$@"; do
     # No -f: the status code is the diagnostic. "404 on every host" and "200 with the
     # wrong bytes" are different problems and used to look identical in the log.
+    rc=0
     code="$(curl -L --retry 2 --retry-delay 1 --connect-timeout 20 -sS \
-      -o "$dest.part" -w '%{http_code}' "$url" 2>/dev/null)" || true
+      -o "$dest.part" -w '%{http_code}' "$url" 2>/dev/null)" || rc=$?
+    # curl still reports 200 when it gets the body but cannot write it (exit 23, e.g. the
+    # cache directory not created yet by the fetch path), which reads as "wrong bytes".
+    if [[ "$rc" != 0 || ! -s "$dest.part" ]]; then
+      log "  curl exit $rc, http ${code:-000}: $url"
+      rm -f "$dest.part"
+      continue
+    fi
     if [[ "$code" == 200 ]]; then
       got="$(sha256 "$dest.part")"
       if [[ "$got" == "$want" ]]; then mv "$dest.part" "$dest"; return 0; fi
-      log "  200 but wrong bytes: $url"
+      log "  200 but wrong bytes (${got:0:12} != ${want:0:12}): $url"
       rm -f "$dest.part"
     else
       log "  http ${code:-000}: $url"
