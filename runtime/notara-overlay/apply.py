@@ -181,7 +181,10 @@ def verify(rootfs: str) -> int:
     """把刚写出的归档当成"别人会怎么解"来验,返回解压后字节数。"""
     with tarfile.open(rootfs, "r:xz") as tar:
         members = tar.getmembers()
-        names = {m.name.removeprefix("./") for m in members}
+        # 新归档的成员名带 "./" 前缀(因为 pack() 交给 tar 的是 "."),而归档里
+        # 也可能两种写法混着出现,所以统一去掉前缀再索引。
+        index = {m.name.removeprefix("./"): m for m in members}
+        names = set(index)
 
         # 1. 自指硬链接。这是上一次真机翻车的直接原因:Android 解压器先把目标
         #    删掉再 link,目标又是它自己,文件就没了。
@@ -208,13 +211,13 @@ def verify(rootfs: str) -> int:
                 sys.exit("归档缺文件:%s(proot 会直接启动失败)" % path)
 
         # 4. 不能是空壳:env 必须是可执行的 ELF。
-        handle = tar.extractfile("usr/bin/env")
+        handle = tar.extractfile(index["usr/bin/env"])
         head = handle.read(4) if handle else b""
         if head != b"\x7fELF":
             sys.exit("usr/bin/env 不是 ELF 可执行文件(前 4 字节 %r)" % head)
 
         def read(path: str) -> str:
-            member = tar.extractfile(path)
+            member = tar.extractfile(index[path])
             return member.read().decode("utf-8", "replace") if member else ""
 
         # 5. 改动内容自证。
