@@ -42,6 +42,16 @@ env:
   NOTARA_REPO: https://github.com/TongZi2003/Notara.git
   NOTARA_REF: 09a73bb749fe1f452ca53acdbf73fcc4b9704692
   NOTARA_PLUGIN_SRC: examples/native-vault
+  # 插件的 package.json 只声明了 10 个依赖，但源码还直接 import 了下面这些——它们在
+  # Notara 的 monorepo 里靠 npm 提升才找得到，单独装这个包就会缺：
+  #   index.js:15 急切引入 session-groups-runtime.js，后者顶层 import zod（缺了插件根本不加载）
+  #   code-editor-client.js / live-preview.js / math-latex.js 是给 WebView 的客户端模块，
+  #   白板代码编辑器和 LaTeX 渲染全靠 @codemirror/* 和 katex
+  # 版本一律取自 Notara 自己的 package-lock.json，不在这里手写。
+  NOTARA_PLUGIN_EXTRA_DEPS: >-
+    zod katex @codemirror/state @codemirror/view @codemirror/language
+    @codemirror/commands @codemirror/autocomplete @codemirror/lang-markdown
+    @codemirror/lang-javascript @codemirror/lang-python @codemirror/legacy-modes
 
 jobs:
   runtime:
@@ -81,7 +91,7 @@ jobs:
           path: |
             runtime/out/arm64-v8a
             runtime/out/manifest.json
-          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}
+          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**', '.github/workflows/build-notara.yml') }}
 
       - name: Fetch the Notara teaching engine
         if: steps.rootfs.outputs.cache-hit != 'true'
@@ -103,11 +113,34 @@ jobs:
           # package.json 里 10 个依赖都写死了版本，没有 workspace: 协议，可以独立装。
           cp -a "notara/$NOTARA_PLUGIN_SRC/." "$RUNNER_TEMP/plugin/"
           rm -f "$RUNNER_TEMP"/plugin/*.test.js
+
+          # 未被声明、但源码真的 import 了的包，版本从 Notara 的 lock 里取
+          python3 - <<'PY' > "$RUNNER_TEMP/extra.txt"
+          import json, os
+          lock = json.load(open("notara/package-lock.json", encoding="utf-8"))
+          packages = lock.get("packages") or {}
+          for name in os.environ["NOTARA_PLUGIN_EXTRA_DEPS"].split():
+              version = (packages.get("node_modules/" + name) or {}).get("version")
+              # 一列包名、一列 install 参数：名字里本身带 @，不能在 shell 里切
+              print("%s\t%s" % (name, name + "@" + version if version else name))
+          PY
+          echo "--- 额外依赖 ---"; cat "$RUNNER_TEMP/extra.txt"
+
           cd "$RUNNER_TEMP/plugin"
           # --os/--cpu/--libc：在 x64 runner 上装出 arm64 Android 能用的树（原生 .node 必须是 aarch64）
+          # --no-save：不改 package.json，只把树装全
+          mapfile -t specs < <(cut -f2 "$RUNNER_TEMP/extra.txt")
           npm install --ignore-scripts --no-audit --no-fund --engine-strict=false \
-            --os=linux --cpu=arm64 --libc=glibc --omit=dev
+            --os=linux --cpu=arm64 --libc=glibc --omit=dev --no-save "${specs[@]}"
           echo "packages: $(ls node_modules | wc -l), size: $(du -sh node_modules | cut -f1)"
+
+          # 缺一个，插件就是加载不了或白板没有 LaTeX，这里先拦住
+          missing=0
+          while IFS=$'\t' read -r name spec; do
+            [[ -d "node_modules/$name" ]] || { echo "MISSING: $name ($spec)"; missing=1; }
+          done < "$RUNNER_TEMP/extra.txt"
+          [[ $missing == 0 ]] || exit 1
+
           # 装出来的原生模块必须是 aarch64，否则装进手机也跑不起来
           bad=0
           while IFS= read -r f; do
