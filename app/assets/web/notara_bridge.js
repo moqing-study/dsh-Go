@@ -14,6 +14,28 @@
 (function () {
   if (window.__dshGoShow) return;
 
+  // 下行的**会话通道**:Notara 源码里 `window.DshAppOpen?.postMessage(...)` 指
+  // 的就是这里。网页每开一节课(首页选目录、题库点题、计划开课)都把真实
+  // sessionId 发回来,原生侧据此把对话切到同一节课——"对话里聊哪道题,白板就
+  // 画哪道题"靠的是同一个 id,不是猜。
+  //
+  // 定义必须放在最前面:开课可能发生在首屏,不能等某个函数被调用之后才存在。
+  // 也不写死 channel 名:NotaraBridge 是本壳注入的,换个壳就变。
+  window.DshAppOpen = {
+    postMessage: function (payload) {
+      try {
+        var text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+        if (window.NotaraBridge && typeof window.NotaraBridge.postMessage === 'function') {
+          window.NotaraBridge.postMessage(text);
+          return true;
+        }
+      } catch (error) {
+        /* 通道不可用就当没这回事:网页自身功能不受影响。 */
+      }
+      return false;
+    },
+  };
+
   var VIEWS = {
     board: ['白板', '画布', '板书', 'Board', 'Whiteboard'],
     lesson: ['教室', '课堂', '上课', 'Lesson', 'Classroom', 'Class'],

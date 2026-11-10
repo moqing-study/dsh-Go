@@ -36,6 +36,7 @@ class TeachingTopBar extends StatelessWidget {
     this.modelChip,
     this.onTitleTap,
     this.title,
+    this.boardFresh = false,
   });
 
   final TeachingView view;
@@ -64,6 +65,9 @@ class TeachingTopBar extends StatelessWidget {
   /// 点标题(课堂名)看详情。
   final VoidCallback? onTitleTap;
   final String? title;
+
+  /// 后台网页刚把白板改完:在「白板」上亮一个小点。
+  final bool boardFresh;
 
   /// 不含状态栏的高度。48–52dp 区间取 50:一行放得下 44 的键,又不显空。
   static const barHeight = 50.0;
@@ -96,7 +100,7 @@ class TeachingTopBar extends StatelessWidget {
                 Expanded(
                   child: Row(
                     children: [
-                      Flexible(child: _ViewSwitch(view: view, onView: onView, compact: compact)),
+                      Flexible(child: _ViewSwitch(view: view, onView: onView, compact: compact, boardFresh: boardFresh)),
                       if (modelChip != null && !compact) ...[
                         const SizedBox(width: AppSpace.sm),
                         Flexible(child: modelChip!),
@@ -129,21 +133,32 @@ class TeachingTopBar extends StatelessWidget {
 /// 三视图分段控件。选中态用底部一条细线,不做整块高亮——顶栏只有一行,
 /// 色块会把 50dp 撑满,反而看不清选的是哪个。
 class _ViewSwitch extends StatelessWidget {
-  const _ViewSwitch({required this.view, required this.onView, required this.compact});
+  const _ViewSwitch({
+    required this.view,
+    required this.onView,
+    required this.compact,
+    required this.boardFresh,
+  });
 
   final TeachingView view;
   final ValueChanged<TeachingView> onView;
   final bool compact;
+  final bool boardFresh;
+
+  /// 只有这三个是「视图」。抽屉的分区状态([TeachingView.section])不上顶栏,
+  /// 否则会多出一个第四键,而且它本来就不该高亮任何一个课堂页签。
+  static const _tabs = [TeachingView.chat, TeachingView.board, TeachingView.lesson];
 
   @override
   Widget build(BuildContext context) {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        for (final item in TeachingView.values)
+        for (final item in _tabs)
           _ViewTab(
             label: item.label,
             active: item == view,
+            dot: item == TeachingView.board && boardFresh,
             onTap: () {
               if (item == view) return;
               HapticFeedback.selectionClick();
@@ -157,12 +172,21 @@ class _ViewSwitch extends StatelessWidget {
 }
 
 class _ViewTab extends StatelessWidget {
-  const _ViewTab({required this.label, required this.active, required this.onTap, required this.compact});
+  const _ViewTab({
+    required this.label,
+    required this.active,
+    required this.onTap,
+    required this.compact,
+    this.dot = false,
+  });
 
   final String label;
   final bool active;
   final VoidCallback onTap;
   final bool compact;
+
+  /// 后台白板刚画完新图:在标签右上角点一个点。
+  final bool dot;
 
   @override
   Widget build(BuildContext context) {
@@ -181,13 +205,28 @@ class _ViewTab extends StatelessWidget {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Text(
-                label,
-                style: style?.copyWith(
-                  fontSize: compact ? 13 : 14,
-                  fontWeight: active ? FontWeight.w600 : FontWeight.w400,
-                  color: active ? colors.onSurface : colors.onSurfaceVariant,
-                ),
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Text(
+                    label,
+                    style: style?.copyWith(
+                      fontSize: compact ? 13 : 14,
+                      fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                      color: active ? colors.onSurface : colors.onSurfaceVariant,
+                    ),
+                  ),
+                  if (dot)
+                    Positioned(
+                      right: -6,
+                      top: -1,
+                      child: Container(
+                        width: 5,
+                        height: 5,
+                        decoration: BoxDecoration(color: colors.primary, shape: BoxShape.circle),
+                      ),
+                    ),
+                ],
               ),
               const SizedBox(height: 3),
               AnimatedContainer(

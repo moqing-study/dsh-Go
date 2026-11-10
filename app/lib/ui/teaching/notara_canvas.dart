@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
@@ -38,6 +39,36 @@ class NotaraCanvasController extends ChangeNotifier {
   TeachingView? _shownView;
   TeachingView? get shownView => _shownView;
 
+  /// 网页当前这节课的 sessionId。
+  ///
+  /// 切视图、点四键、存取教法都要带上它:不带课号的白板只能自己猜一节课,
+  /// 猜错就是"对话里聊 A、白板画 B"。由直连结果与网页回传共同维护。
+  String? _activeSessionId;
+  String? get activeSessionId => _activeSessionId;
+
+  /// 抽屉当前落在哪一节。
+  TeachingSection? _section;
+  TeachingSection? get section => _section;
+
+  /// 网页开了课(首页选目录、题库点题、计划开课)时通知外壳。
+  ///
+  /// 参数是网页刚打开的真实 sessionId 与目标视图。外壳据此把原生对话切到
+  /// 同一个会话——这就是"课堂 1:1 映射",而不是两套各记各的账。
+  void Function(String sessionId, String view)? onSessionOpened;
+
+  /// 后台白板画完了新图。顶栏据此在「白板」上亮一个小点。
+  ///
+  /// 这不是装饰:学生在对话页聊题时,网页在后台照样收流、照样画。图已经
+  /// 画好却让他切过去再等一次渲染,等于白等。
+  bool _boardFresh = false;
+  bool get boardFresh => _boardFresh;
+
+  void clearBoardFresh() {
+    if (!_boardFresh) return;
+    _boardFresh = false;
+    notifyListeners();
+  }
+
   void attach(WebViewController controller, Uri url) {
     _web = controller;
     _url = url;
@@ -68,23 +99,15 @@ class NotaraCanvasController extends ChangeNotifier {
       ..setBackgroundColor(const Color(0xFF151517))
       ..addJavaScriptChannel(
         'NotaraBridge',
-        onMessageReceived: (message) {
-          // 网页回报视图切换结果:{"view":"board"} / {"view":"lesson"}
-          final payload = message.message;
-          if (payload.contains('board')) {
-            _shownView = TeachingView.board;
-          } else if (payload.contains('lesson')) {
-            _shownView = TeachingView.lesson;
-          } else if (payload.contains('chat')) {
-            _shownView = TeachingView.chat;
-          }
-          notifyListeners();
-        },
+        onMessageReceived: (message) => _onBridgeMessage(message.message),
       )
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (_) async {
             await _injectBridge();
+            // 网页首屏就默认无壳,这里再确认一次:页面重载会清掉 body 上的
+            // 标记,不清掉的就是别人关过它。
+            await setEmbedded(true);
             markLoaded();
           },
           onWebResourceError: (error) {
@@ -96,17 +119,92 @@ class NotaraCanvasController extends ChangeNotifier {
     attach(controller, url);
   }
 
-  /// 切到某个教学视图。返回 false 表示网页里没找到对应入口(需要用户手动点)。
-  Future<bool> show(TeachingView view) async {
+  /// 调用网页的直连入口,返回它自己的结果对象。
+  ///
+  /// Notara 那边把 `{ok:false, reason:'no_session'}` 这一类答案原样交回来,
+  /// 所以这里不做"看起来成功"的兜底:解析不出对象就是 null,由调用方决定
+  /// 是退到旧入口还是如实告诉用户。
+  Future<Map<String, dynamic>?> call(String expression) async {
+    final web = _web;
+    if (web == null) return null;
+    try {
+      final raw = await web.runJavaScriptReturningResult(expression);
+      return _decodeResult(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// WebView 交回来的东西可能是已解码的 Map,也可能是一层甚至两层 JSON 文本
+  /// (Android 的 evaluateJavascript 会把字符串再编码一次)。逐层剥,剥不动
+  /// 就放弃——不猜内容。
+  static Map<String, dynamic>? _decodeResult(Object? raw) {
+    if (raw == null) return null;
+    var text = raw is String ? raw : '$raw';
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (text.isEmpty || text == 'null') return null;
+      try {
+        final value = jsonDecode(text);
+        if (value is Map<String, dynamic>) return value;
+        if (value is String) {
+          text = value;
+          continue;
+        }
+        return null;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /// 切到某节课的某个视图。**先开课,再切视图**:不带课号的白板会先画出
+  /// 上一节课的板书,那正是"对话里聊 A、白板画 B"的来源。
+  Future<bool> show(TeachingView view, {String? sessionId}) async {
     final web = _web;
     if (web == null) return false;
-    final js = _scriptFor(view);
-    if (js == null) return false;
+    final name = switch (view) {
+      TeachingView.chat => 'chat',
+      TeachingView.board => 'board',
+      TeachingView.lesson => 'classroom',
+      // 分区视图由 openSection 驱动,不经过这里。
+      TeachingView.section => 'chat',
+    };
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.openLessonView('
+      '${jsonEncode(sessionId ?? '')}, ${jsonEncode(name)}) : null',
+    );
+    if (result != null) {
+      final ok = result['ok'] == true;
+      if (ok) {
+        _shownView = view;
+        _activeSessionId = (result['sessionId'] as String?) ?? sessionId;
+        if (view == TeachingView.board) {
+          _boardFresh = false;
+          // 白板比视口宽:切过来就按宽度收一档,平板竖屏才看得全。
+          await fitBoard();
+        }
+        notifyListeners();
+      }
+      return ok;
+    }
+    // 直连接口没加载到(网页还是上一版):退回原来的"找入口再点",并记下来,
+    // 好让界面知道现在是降级状态。
+    final legacy = await _legacyShow(view);
+    if (legacy) {
+      _shownView = view;
+      notifyListeners();
+    }
+    return legacy;
+  }
+
+  Future<bool> _legacyShow(TeachingView view) async {
+    final web = _web;
+    if (web == null) return false;
     try {
-      final result = await web.runJavaScriptReturningResult(js);
+      final result = await web.runJavaScriptReturningResult(_scriptFor(view));
       final ok = result == true || result == 'true';
       if (ok) _shownView = view;
-      notifyListeners();
       return ok;
     } catch (_) {
       return false;
@@ -117,12 +215,104 @@ class NotaraCanvasController extends ChangeNotifier {
   Future<bool> showSection(TeachingSection section) async {
     final web = _web;
     if (web == null) return false;
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.openSection('
+      '${jsonEncode(section.webKey)}, null) : null',
+    );
+    if (result != null) {
+      final ok = result['ok'] == true;
+      if (ok) {
+        _section = section;
+        notifyListeners();
+      }
+      return ok;
+    }
     try {
-      final result = await web.runJavaScriptReturningResult(_sectionScript(section));
-      return result == true || result == 'true';
+      final legacy = await web.runJavaScriptReturningResult(_sectionScript(section));
+      final ok = legacy == true || legacy == 'true';
+      if (ok) _section = section;
+      return ok;
     } catch (_) {
       return false;
     }
+  }
+
+  /// 课堂四键。`history / teaching / summary` 各自对应 Notara 里真实的面板
+  /// 开关;`more` 由原生自己弹(那是窄屏折叠,不是网页功能)。
+  ///
+  /// 网页里没有登记这个面板时返回 false——**不退回点击**,那正是要废掉的东西。
+  Future<bool> openHeaderAction(String key) async {
+    final web = _web;
+    if (web == null) return false;
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.openHeaderAction('
+      '${jsonEncode(key)}) : null',
+    );
+    return result?['ok'] == true;
+  }
+
+  /// 当前网页真的登记了哪些面板。启动自检与窄屏折叠都用它。
+  Future<List<String>> headerActions() async {
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.headerActions() : null',
+    );
+    final keys = result?['keys'];
+    if (keys is! List) return const [];
+    return keys.whereType<String>().toList(growable: false);
+  }
+
+  /// 真实的教法列表:标题、说明、id 都来自这节课的教学设置回执。
+  Future<List<TeachingSkill>> listSkills(String? sessionId) async {
+    final id = sessionId ?? _activeSessionId ?? '';
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.listSkills(${jsonEncode(id)}) : null',
+    );
+    if (result == null || result['ok'] != true) return const [];
+    final raw = result['skills'];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((item) => TeachingSkill(
+              id: '${item['id'] ?? ''}',
+              title: '${item['title'] ?? ''}',
+              description: '${item['description'] ?? ''}',
+            ))
+        .where((skill) => skill.id.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  /// 选定一个教法。走的是和网页面板同一条写路径(带 revision),所以冲突能
+  /// 如实报出来,而不是本地改个变量当作生效。
+  Future<bool> selectSkill(String? sessionId, String skillId) async {
+    final id = sessionId ?? _activeSessionId ?? '';
+    final web = _web;
+    if (web == null || id.isEmpty) return false;
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.selectSkill('
+      '${jsonEncode(id)}, ${jsonEncode(skillId)}) : null',
+    );
+    return result?['ok'] == true;
+  }
+
+  /// 让白板按当前视口宽度铺满(只缩不放)。
+  Future<void> fitBoard() async {
+    await _run('window.__NOTARA_DIRECT__ && window.__NOTARA_DIRECT__.fitBoard();');
+  }
+
+  /// 确认有一节课可上;没有就现开一节(带教学预设)。
+  ///
+  /// 网页侧是异步建会话,结果通过 [onSessionOpened] 回来,所以这里不等返回值:
+  /// 返回 true 只表示"已经在开了"。
+  Future<bool> ensureSession() async {
+    final result = await call(
+      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.ensureSession() : null',
+    );
+    return result?['ok'] == true;
+  }
+
+  /// 内嵌无壳模式。网页首屏就默认无壳,这里再确认一次,防止它被别处关掉。
+  Future<void> setEmbedded(bool on) async {
+    await _run('window.__NOTARA_DIRECT__ && window.__NOTARA_DIRECT__.setEmbedded($on);');
   }
 
   /// 顶栏右侧四键:`⏱ 🎚 📄 ⋯` 各自对应 Notara 自己的面板(课堂历史/计时、
@@ -156,6 +346,51 @@ class NotaraCanvasController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 网页回来的两类消息。
+  ///
+  ///   `{"type":"notaraSession","sessionId":"…","view":"…"}`  网页开课了
+  ///   `{"view":"board"}`                                      旧桥的切视图回执
+  ///
+  /// 分开处理:旧回执**不带课号**,所以它只能说明"网页画到哪一页",绝不能
+  /// 拿来判断"是哪一节课"。之前的实现用 `contains('board')` 猜,连会话消
+  /// 息都会被误判成视图回执,这里一并修掉。
+  void _onBridgeMessage(String raw) {
+    Map<String, dynamic>? data;
+    try {
+      final value = jsonDecode(raw);
+      if (value is Map<String, dynamic>) data = value;
+    } catch (_) {
+      data = null;
+    }
+    if (data == null) return;
+    if (data['type'] == 'notaraSession') {
+      final id = '${data['sessionId'] ?? ''}';
+      if (id.isEmpty) return;
+      _activeSessionId = id;
+      onSessionOpened?.call(id, '${data['view'] ?? ''}');
+      notifyListeners();
+      return;
+    }
+    if (data['type'] == 'notaraBoard') {
+      // 后台把图改完了:亮个点,不抢当前视图。
+      _boardFresh = true;
+      notifyListeners();
+      return;
+    }
+    switch ('${data['view'] ?? ''}') {
+      case 'board':
+        _shownView = TeachingView.board;
+      case 'notara-vault-classroom':
+      case 'lesson':
+        _shownView = TeachingView.lesson;
+      case 'chat':
+        _shownView = TeachingView.chat;
+      default:
+        break;
+    }
+    notifyListeners();
+  }
+
   Future<void> reload() async {
     final url = _url;
     if (url == null) return;
@@ -185,10 +420,11 @@ class NotaraCanvasController extends ChangeNotifier {
     }
   }
 
-  static String? _scriptFor(TeachingView view) => switch (view) {
+  static String _scriptFor(TeachingView view) => switch (view) {
     TeachingView.chat => 'window.__dshGoShow && window.__dshGoShow("chat");',
     TeachingView.board => 'window.__dshGoShow && window.__dshGoShow("board");',
     TeachingView.lesson => 'window.__dshGoShow && window.__dshGoShow("lesson");',
+    TeachingView.section => 'window.__dshGoShow && window.__dshGoShow("chat");',
   };
 
   static String _sectionScript(TeachingSection section) =>
@@ -210,39 +446,70 @@ final notaraCanvasProvider = Provider<NotaraCanvasController>((ref) {
 /// 白板 / 教室的显示面。**同一个** [WebViewWidget] 实例,两个视图轮换显示,
 /// 不重建。
 class NotaraCanvas extends ConsumerStatefulWidget {
-  const NotaraCanvas({super.key, required this.view});
+  const NotaraCanvas({super.key, required this.view, this.sessionId});
 
-  final TeachingView view;
+  /// 要驱动的视图。null 表示"网页自己在导航"(抽屉的首页/题库/计划/技能),
+  /// 这时外壳不该再用一个视图名把它拽回来。
+  final TeachingView? view;
+
+  /// 当前这节课。切视图时一起交给网页——不带课号的白板只能自己猜一节课。
+  final String? sessionId;
 
   @override
   ConsumerState<NotaraCanvas> createState() => _NotaraCanvasState();
 }
 
 class _NotaraCanvasState extends ConsumerState<NotaraCanvas> {
+  /// 引擎还没起来时,每一帧都试一次太吵;隔一小会儿再试。
+  bool _warmPending = false;
+
   @override
   void initState() {
     super.initState();
-    // 进来就确保页面在加载(用户在对话页时通常已经预热过)。
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      final canvas = ref.read(notaraCanvasProvider);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _ensureLoaded());
+  }
+
+  /// 引擎(proot + dsh web)起来之前拿不到 baseUri/token。
+  ///
+  /// 以前这里只试一次就放弃,结果"先开 App、引擎稍后才就绪"的机器上永远
+  /// 停在占位图。现在每次依赖变化都回来试:起来了就加载,端口/token 变了就
+  /// 重新加载。
+  void _ensureLoaded() {
+    if (!mounted || _warmPending) return;
+    final status = ref.read(localRuntimeProvider).status;
+    final ready = status.baseUrl != null && status.token != null;
+    if (!ready) return;
+    final canvas = ref.read(notaraCanvasProvider);
+    if (canvas.web != null) return;
+    _warmPending = true;
+    unawaited(() async {
       await canvas.warmUp(ref);
       if (!mounted) return;
+      _warmPending = false;
       await canvas.resume();
-      await canvas.show(widget.view);
-    });
+      final view = widget.view;
+      if (view != null) await canvas.show(view, sessionId: widget.sessionId);
+    }());
   }
 
   @override
   void didUpdateWidget(NotaraCanvas oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.view != widget.view) {
-      unawaited(ref.read(notaraCanvasProvider).show(widget.view));
+    final view = widget.view;
+    if (view == null) return;
+    if (oldWidget.view != widget.view || oldWidget.sessionId != widget.sessionId) {
+      // 带上课号:白板要画的是这节课的板书,不是上一节的。
+      unawaited(ref.read(notaraCanvasProvider).show(view, sessionId: widget.sessionId));
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final canvas = ref.read(notaraCanvasProvider);
+    // 引擎状态一变就重试加载:这是"起来之后画布自己出现"的落点。
+    ref.listen(localRuntimeProvider.select((s) => s.status.phase), (_, _) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _ensureLoaded());
+    });
     // 画布从"没起来"到"起来了"是一次外部状态变化,用 AnimatedBuilder 听,
     // 不必让 provider 层跟着重建。
     return AnimatedBuilder(

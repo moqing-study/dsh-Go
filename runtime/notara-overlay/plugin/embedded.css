@@ -1,0 +1,70 @@
+/*
+ * 内嵌无壳模式:宿主(Flutter)自己画顶栏和输入框,网页只当画布。
+ *
+ * 选择器全部是本插件自己渲染的节点(workspace-client.js / rail-client.js /
+ * classroom-client.js 里的 className),不是宿主外壳的内部结构,所以换一版
+ * 宿主也不会失效。只在 `body[data-dsh-go-embedded="true"]` 下生效;浏览器里
+ * 直接打开页面时保持原样,方便对照与截图。
+ */
+
+/* 左侧 56px 图标栏:五大入口已搬进原生抽屉。 */
+body[data-dsh-go-embedded='true'] .nv-rail,
+body[data-dsh-go-embedded='true'] .nv-rail-foot {
+  display: none !important;
+}
+
+/* 课堂顶栏整条收起:它上半是 DSH 自己的会话头(宿主已有 50dp 顶栏),
+   下半是 对话/白板/教室 切换条与四键(宿主顶栏接管)。 */
+body[data-dsh-go-embedded='true'] .nv-class-topbar,
+body[data-dsh-go-embedded='true'] .nv-class-views {
+  display: none !important;
+}
+
+/* 非课堂页残留的视图页签条(对话/白板/文件/图谱…)同理。 */
+body[data-dsh-go-embedded='true'] .nv-workspace-tabs {
+  display: none !important;
+}
+
+/* 白板视图只留白板:旁边的对话窗格带着网页自己的输入框,而输入在原生侧。
+   靠 `data-nv-view` 精确选中,不按位置猜。 */
+body[data-dsh-go-embedded='true'] .nv-panes[data-nv-board='true'] {
+  grid-template-columns: minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) !important;
+}
+body[data-dsh-go-embedded='true'] .nv-panes[data-nv-board='true'] > .nv-pane[data-nv-view='chat'],
+body[data-dsh-go-embedded='true'] .nv-panes[data-nv-board='true'] > .nv-split-handle {
+  display: none !important;
+}
+
+/* 工作区根节点铺满:宿主自带的侧栏与底部输入区被这一层盖住。 */
+body[data-dsh-go-embedded='true'] .nv-workspace {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  display: flex;
+  flex-direction: column;
+  background: var(--dsw-alias-bg-base, var(--nv-bg, #151517));
+  color: var(--dsw-alias-text-primary, inherit);
+}
+
+/* 内容区吃掉顶部安全区。 */
+body[data-dsh-go-embedded='true'] .nv-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+/* 圆角与描边对齐原生:卡片、面板统一用同一档半径,避免"网页方块感"。 */
+body[data-dsh-go-embedded='true'] .nv-workspace :is(.nv-panel, .nv-card, .nv-skill-page, .nv-calendar-empty) {
+  border-radius: var(--dsw-alias-radius-card, 14px);
+}
+
+/* 安全区:底部手势条不能压住内容。 */
+body[data-dsh-go-embedded='true'] .nv-panes > * {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* 白板与立体几何允许双指缩放;单指仍然是平移,和网页自己的拖拽一致。 */
+body[data-dsh-go-embedded='true'] .nv-panes {
+  touch-action: pan-x pan-y pinch-zoom;
+}

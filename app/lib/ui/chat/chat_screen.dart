@@ -98,6 +98,8 @@ import 'voice/voice_controller.dart';
 import 'widgets/activity_strip.dart';
 import 'widgets/attachments.dart';
 import 'widgets/notice_row.dart';
+import '../teaching/notara_canvas.dart';
+import '../teaching/teaching_types.dart';
 import 'widgets/permission_pill.dart';
 import 'widgets/plus_panel.dart';
 import 'widgets/quote_chip.dart';
@@ -114,7 +116,9 @@ class ChatScreen extends ConsumerStatefulWidget {
     this.backdrop = true,
     this.topBar,
     this.customTopBar = false,
+    this.hideComposer = false,
     this.topBarHeight = 50,
+    this.onBeforeSend,
   });
 
   /// Opens the sessions drawer (the shell owns the drawer).
@@ -134,8 +138,20 @@ class ChatScreen extends ConsumerStatefulWidget {
   /// (纯净阅读),这时只留状态栏的 inset。
   final bool customTopBar;
 
+  /// 纯净阅读:连底部输入区一起收起,整屏只剩下正文。
+  ///
+  /// 只把顶栏置空是不够的——输入框、待办条、状态条还占着底部一大块,那就
+  /// 不是"纯净看书",而是"少了一条横线"。这里让它们一起退场。
+  final bool hideComposer;
+
   /// 自定义顶栏的内容高度,不含状态栏。与 ChatHeader.barHeight 同一契约。
   final double topBarHeight;
+
+  /// 发送前的最后一步(教学壳用来确认"这节课存在")。
+  ///
+  /// 空课号时直接发出去,得到的是一节普通对话:网页不认它是课堂,白板、
+  /// 教室、四键全都找不到东西。所以在真正落库之前先给它开一节课堂。
+  final Future<void> Function()? onBeforeSend;
 
   @override
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
@@ -623,6 +639,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     if (generate != null && !_generateReady(generate, typed, drafts)) return;
     final client = ref.read(activeConnectionProvider).value?.client;
     if (client == null) return;
+    // 空课号先开课堂,再发这条消息。
+    await widget.onBeforeSend?.call();
     final generation = client.mux.generation;
     final scope = _draftScope;
     bool ownsDraft() => identical(_draftScope, scope) && _sameConnection(client, generation);
@@ -959,14 +977,38 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
   // ---------------------------------------------------------------------------
   // 附件
 
-  /// 「调用教学技能」:在光标处放一句"该怎么讲"的开头,焦点留在输入框,
-  /// 用户接着说要讲什么。
+  /// 「调用教学技能」:列出**这节课真实的教法**,选中就写进这节课的设置。
   ///
-  /// 为什么不直接替他选一个技能:技能目录在 Notara 插件里,原生这层只知道
-  /// "这一轮要按教学的方式回答"。假装选中一个反而会让用户以为已经切了课,
-  /// 结果回答还是默认语气——那比多打半句话糟得多。
-  void _insertTeachingPrompt() {
-    const prompt = '请用这个课堂的教学方式讲解：';
+  /// 列表来自 `teachingSettings().choices`——网页里那个单选列表长什么样,这里
+  /// 就长什么样;选中后走的是网页面板保存的同一条写路径(带 revision),所以
+  /// "已生效"是真的生效。
+  ///
+  /// 上一版只塞一句固定文本,等于什么都没切:用户以为换了讲法,回答还是默认
+  /// 语气。读不到列表时如实说读不到,也不塞假选项。
+  Future<void> _insertTeachingPrompt() async {
+    final canvas = ref.read(notaraCanvasProvider);
+    final sessionId = canvas.activeSessionId ?? ref.read(currentSessionProvider);
+    final skills = await canvas.listSkills(sessionId);
+    if (!mounted) return;
+    if (skills.isEmpty) {
+      showBriefNotice(context, '这节课还没有可选的教法：先在输入框发一句话，再点一次。');
+      return;
+    }
+    final picked = await showModalBottomSheet<TeachingSkill>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => _TeachingSkillSheet(skills: skills),
+    );
+    if (picked == null || !mounted) return;
+    final ok = await canvas.selectSkill(sessionId, picked.id);
+    if (!mounted) return;
+    if (!ok) {
+      showBriefNotice(context, '这个教法没写进这节课，稍后再试。');
+      return;
+    }
+    // 讲法已切换,再把"接下来这段按它讲"落到光标处,焦点留在输入框。
+    final prompt = '请按「${picked.title}」的方式讲解：';
     final text = _input.text;
     final selection = _input.selection;
     final start = selection.isValid ? selection.start : text.length;
@@ -1007,7 +1049,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         teaching: widget.customTopBar,
       );
       if (choice is TeachingChoice) {
-        if (ownsDraft()) _insertTeachingPrompt();
+        if (ownsDraft()) await _insertTeachingPrompt();
         return;
       }
       if (choice is GenerateChoice) {
@@ -2021,30 +2063,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
                                 // each zero high when empty. Folded, they take
                                 // one row (dock_stack.dart). They fold away
                                 // while a phone on its side types.
-                                _DockAside(
-                                  aside: typing,
-                                  child: BackdropGroup(
-                                    child: DockStack(
-                                      cards: [
-                                        if (sessionId != null) ...[
-                                          TodoDockSlot(sessionId: sessionId),
-                                          GoalDockSlot(sessionId: sessionId),
-                                          ActivityStripSlot(
-                                            sessionId: sessionId,
-                                            onTap: () => _openRunningTrajectory(sessionId),
-                                            // The todo bar shows it, unless it is folded behind the strip.
-                                            todoProgress: ref.watch(dockFoldedProvider),
-                                          ),
+                                // 纯净阅读时整块收起:底部不留任何一条。
+                                if (!widget.hideComposer)
+                                  _DockAside(
+                                    aside: typing,
+                                    child: BackdropGroup(
+                                      child: DockStack(
+                                        cards: [
+                                          if (sessionId != null) ...[
+                                            TodoDockSlot(sessionId: sessionId),
+                                            GoalDockSlot(sessionId: sessionId),
+                                            // 教学模式下不摆 tok/s · 步数:那是写代码时的
+                                            // 仪表盘,课堂里要看的是"讲到哪了",不是
+                                            // "跑了多少 token"。待办与目标条保留。
+                                            if (!widget.customTopBar) ActivityStripSlot(
+                                              sessionId: sessionId,
+                                              onTap: () => _openRunningTrajectory(sessionId),
+                                              // The todo bar shows it, unless it is folded behind the strip.
+                                              todoProgress: ref.watch(dockFoldedProvider),
+                                            ),
+                                          ],
+                                          // It gives the activity strip its place while a reply generates.
+                                          if (!readOnly) ComposerStripSlot(sessionId: sessionId, visible: !running),
                                         ],
-                                        // It gives the activity strip its place while a reply generates.
-                                        if (!readOnly) ComposerStripSlot(sessionId: sessionId, visible: !running),
-                                      ],
-                                      accessory: pillsBesideStrip
-                                          ? _stripRisk(sessionId, autoApprove: chat?.autoApprove ?? false)
-                                          : null,
+                                        accessory: pillsBesideStrip
+                                            ? _stripRisk(sessionId, autoApprove: chat?.autoApprove ?? false)
+                                            : null,
+                                      ),
                                     ),
                                   ),
-                                ),
                                 // The capsules (ui.json's and plugins'), led
                                 // by the chat's pills; they step aside while a
                                 // reply generates; nothing at all without any.
@@ -2073,7 +2120,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
                                       ]),
                                     ],
                                   ))),
-                                if (readOnly)
+                                if (widget.hideComposer)
+                                  // 纯净阅读:底部整块收起,正文铺到底。
+                                  const SizedBox.shrink()
+                                else if (readOnly)
                                   const ReadOnlyBar()
                                 else
                                   Composer(
@@ -2540,4 +2590,59 @@ class _ChatScaler extends TextScaler {
 
   @override
   int get hashCode => Object.hash(base, factor);
+}
+
+/// 教法列表:一行一条,标题加一句说明,当前在用的那条打勾。
+///
+/// 数据全部来自这节课的教学设置回执,没有本地写死的选项——所以列表里出现的
+/// 每一条,选了都真的能写进去。
+class _TeachingSkillSheet extends StatelessWidget {
+  const _TeachingSkillSheet({required this.skills});
+
+  final List<TeachingSkill> skills;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.7),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('换一种讲法', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 4),
+                  Text(
+                    '选定后写进这节课的设置，下一次提问就按它讲。',
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: skills.length,
+                itemBuilder: (context, index) {
+                  final skill = skills[index];
+                  return ListTile(
+                    title: Text(skill.title),
+                    subtitle: skill.description.isEmpty ? null : Text(skill.description),
+                    onTap: () => Navigator.of(context).pop(skill),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
 }

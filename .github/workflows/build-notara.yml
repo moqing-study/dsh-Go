@@ -83,18 +83,36 @@ jobs:
           restore-keys: runtime-cache-${{ env.NOTARA_REF }}-
 
       # rootfs 是可复现的（SOURCE_DATE_EPOCH 固定、依赖全部 pin 死），所以按配方内容做键。
-      # 只改 Flutter UI 时这个键不变，整个 rootfs 组装直接跳过。
+      #
+      # 键里**不含 workflow 文件**：否则改一行 CI 就让 177MB 的基础 rootfs 作废，
+      # 而这一版真正要变的只是插件前端（见 runtime/notara-overlay）。
+      # `restore-keys` 是第二道保险：键对不上时取最近的一份同源 rootfs，
+      # 再用 overlay 把改过的插件与教学预设覆盖进去。
       - name: Restore the built rootfs
         id: rootfs
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             runtime/out/arm64-v8a
             runtime/out/manifest.json
-          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**', '.github/workflows/build-notara.yml') }}
+          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
+          restore-keys: |
+            rootfs-arm64-${{ env.NOTARA_REF }}-
+
+      # 缓存命中与否只看"归档在不在"，不看 actions/cache 的 cache-hit：
+      # restore-keys 命中也算可用（随后由 overlay 补齐改动）。
+      - name: Do we already have a base rootfs?
+        id: base
+        run: |
+          if [[ -s runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz ]]; then
+            echo "have=1" >> "$GITHUB_OUTPUT"
+            echo "base rootfs: $(du -h runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz | cut -f1)"
+          else
+            echo "have=0" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch the Notara teaching engine
-        if: steps.rootfs.outputs.cache-hit != 'true'
+        if: steps.base.outputs.have != '1'
         run: |
           set -euo pipefail
           git init -q notara && cd notara
@@ -105,7 +123,7 @@ jobs:
           echo "Notara commit: $(git rev-parse HEAD)"
 
       - name: Stage the plugin and install its arm64 dependencies
-        if: steps.rootfs.outputs.cache-hit != 'true'
+        if: steps.base.outputs.have != '1'
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/plugin"
@@ -150,7 +168,7 @@ jobs:
           echo "plugin: $(du -sh . | cut -f1)"
 
       - name: Assemble the rootfs
-        if: steps.rootfs.outputs.cache-hit != 'true'
+        if: steps.base.outputs.have != '1'
         env:
           EXTRA_PLUGINS: notara-vault-native=${{ runner.temp }}/plugin
           XZ_THREADS: 4
@@ -167,18 +185,54 @@ jobs:
           print("extraPlugins:", m.get("extraPlugins"))
           PY
 
-      - name: Check the plugin really made it into the rootfs
+      # 只改插件前端时走这条路：解包 → 覆盖插件与教学预设 → 重算版本与哈希 → 重打。
+      # 大约 8–12 分钟，比全量组装快一个数量级。
+      #
+      # 缓存只有键完全一致时才跳过它——那说明这一版 overlay 已经打进去了。
+      # 其余情况（全量组装、或用旧 base 拼出来的）都要跑：插件此时来自上游
+      # 仓库或旧归档，都不含这一版改动。
+      - name: Apply the Notara overlay to the rootfs
         if: steps.rootfs.outputs.cache-hit != 'true'
+        env:
+          XZ_THREADS: 4
         run: |
           set -euo pipefail
-          tar -tJf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+          python3 runtime/notara-overlay/apply.py \
+            --rootfs runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+            --manifest runtime/out/arm64-v8a/assets/runtime/manifest.json
+
+      - name: Check the plugin really made it into the rootfs
+        run: |
+          set -euo pipefail
+          archive=runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz
+          tar -tJf "$archive" \
             | grep -E '^\.?/?opt/dsh-go/plugins/notara-vault-native/(index\.js|package\.json)$'
-          tar -xJOf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
-            ./etc/dsh-app/dsh-web.patch.yml 2>/dev/null || \
-          tar -xJOf runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
+          echo "--- 改动必须真的在归档里，否则就是拿旧插件骗自己 ---"
+          work=$(mktemp -d)
+          tar -xJf "$archive" -C "$work" \
+            opt/dsh-go/plugins/notara-vault-native/client.js \
             etc/dsh-app/dsh-web.patch.yml
+          for needle in __NOTARA_DIRECT__ openLessonView data-nv-view nv-class-views; do
+            grep -q "$needle" "$work/opt/dsh-go/plugins/notara-vault-native/client.js" \
+              || { echo "MISSING $needle in client.js"; exit 1; }
+          done
+          for needle in preset-notara-teacher agent-preset-registry; do
+            grep -q "$needle" "$work/etc/dsh-app/dsh-web.patch.yml" \
+              || { echo "MISSING $needle in dsh-web.patch.yml"; exit 1; }
+          done
           echo "--- manifest 里必须写着这个版本 ---"
+          grep -o '"runtimeVersion": *"[^"]*"' runtime/out/arm64-v8a/assets/runtime/manifest.json
           grep -o '"extraPlugins":[^]]*]' runtime/out/arm64-v8a/assets/runtime/manifest.json || true
+
+      # 把这次组装/改写后的 rootfs 存回去：下一次命中就是这一版。
+      - name: Save the rootfs
+        if: steps.rootfs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            runtime/out/arm64-v8a
+            runtime/out/manifest.json
+          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
 
       - name: Upload the rootfs
         uses: actions/upload-artifact@v4
