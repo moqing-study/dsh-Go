@@ -124,15 +124,28 @@ fetch_try() {
   local url="$1" dest="$2" want="${3:-}"
   mkdir -p "$(dirname "$dest")"
   if [[ -f "$dest" && -n "$want" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
-  rm -f "$dest"
-  log "download $url"
-  curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -sS -o "$dest.part" "$url" \
-    || { rm -f "$dest.part"; return 1; }
-  if [[ -n "$want" && "$(sha256 "$dest.part")" != "$want" ]]; then
-    rm -f "$dest.part"
-    return 1
-  fi
-  mv "$dest.part" "$dest"
+  # 索引与 InRelease 不一致,常常只是发布窗口里某台 CDN 边缘还在发旧副本:
+  # 隔几秒再来一次就对了。这里的重试是**只读**的,不会接受任何未经校验的字节。
+  local attempt
+  for attempt in 1 2 3 4; do
+    rm -f "$dest" "$dest.part"
+    log "download $url (attempt $attempt)"
+    if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -sS -o "$dest.part" "$url"; then
+      rm -f "$dest.part"
+      sleep $((attempt * 5))
+      continue
+    fi
+    if [[ -n "$want" && "$(sha256 "$dest.part")" != "$want" ]]; then
+      log "  $url: bytes do not match InRelease yet, retrying"
+      rm -f "$dest.part"
+      sleep $((attempt * 5))
+      continue
+    fi
+    mv "$dest.part" "$dest"
+    return 0
+  done
+  rm -f "$dest" "$dest.part"
+  return 1
 }
 
 pin_of() {

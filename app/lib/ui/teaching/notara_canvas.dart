@@ -135,6 +135,67 @@ class NotaraCanvasController extends ChangeNotifier {
     }
   }
 
+  /// 调网页里返回 Promise 的方法。
+  ///
+  /// Android 的 `evaluateJavascript` **不支持 await**:表达式返回 Promise 时,
+  /// 宿主拿到的是 `[object Promise]`,不是结果。而 `listSkills`、`selectSkill`、
+  /// `summarize` 恰恰是 async(它们要读教学设置的 RPC 回执),直接 `call` 只会
+  /// 静默拿到 null——技能列表看起来永远是空的,还找不到报错。
+  ///
+  /// 办法:让网页把结果落到 `window.__dshGoAsync[token]`,宿主短轮询取回。
+  /// 不改 JS 的异步语义,也不用把面板逻辑搬进原生。
+  Future<Map<String, dynamic>?> callAsync(
+    String expression, {
+    Duration timeout = const Duration(seconds: 4),
+  }) async {
+    final web = _web;
+    if (web == null) return null;
+    final token = 'a${DateTime.now().microsecondsSinceEpoch}';
+    final key = jsonEncode(token);
+    final script = '''
+(() => {
+  window.__dshGoAsync = window.__dshGoAsync || {};
+  const key = $key;
+  const done = value => {
+    try { window.__dshGoAsync[key] = JSON.stringify(value === undefined ? null : value); }
+    catch (e) { window.__dshGoAsync[key] = JSON.stringify({ok:false, reason:'unserializable'}); }
+  };
+  try {
+    Promise.resolve($expression).then(done, error => done({
+      ok: false, reason: 'threw',
+      detail: String(error && error.message ? error.message : error),
+    }));
+  } catch (error) {
+    done({ok: false, reason: 'threw', detail: String(error)});
+  }
+  return key;
+})()
+''';
+    try {
+      await web.runJavaScriptReturningResult(script);
+    } catch (_) {
+      return null;
+    }
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      if (_web == null) return null;
+      try {
+        final raw = await web.runJavaScriptReturningResult(
+          '(window.__dshGoAsync && window.__dshGoAsync[$key]) || null',
+        );
+        final decoded = _decodeResult(raw);
+        if (decoded != null) {
+          unawaited(web.runJavaScript('if (window.__dshGoAsync) delete window.__dshGoAsync[$key];'));
+          return decoded;
+        }
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
   /// WebView 交回来的东西可能是已解码的 Map,也可能是一层甚至两层 JSON 文本
   /// (Android 的 evaluateJavascript 会把字符串再编码一次)。逐层剥,剥不动
   /// 就放弃——不猜内容。
@@ -244,11 +305,22 @@ class NotaraCanvasController extends ChangeNotifier {
   Future<bool> openHeaderAction(String key) async {
     final web = _web;
     if (web == null) return false;
-    final result = await call(
-      'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.openHeaderAction('
-      '${jsonEncode(key)}) : null',
-    );
-    return result?['ok'] == true;
+    final expression =
+        'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.openHeaderAction('
+        '${jsonEncode(key)}) : null';
+    // 面板是 React 组件挂载时才登记的。刚从对话页切到教室时它们还没挂上,
+    // 第一次调用拿到的是 no_handler——和"这个面板根本不存在"是两回事。
+    // 重试几次把两者分开,否则四键会莫名其妙弹一次"未登记"。
+    for (var attempt = 0; attempt < 3; attempt++) {
+      final result = await call(expression);
+      if (result == null) return false;
+      if (result['ok'] == true) return true;
+      if (result['reason'] != 'no_handler') return false;
+      if (attempt < 2) {
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+      }
+    }
+    return false;
   }
 
   /// 当前网页真的登记了哪些面板。启动自检与窄屏折叠都用它。
@@ -264,7 +336,7 @@ class NotaraCanvasController extends ChangeNotifier {
   /// 真实的教法列表:标题、说明、id 都来自这节课的教学设置回执。
   Future<List<TeachingSkill>> listSkills(String? sessionId) async {
     final id = sessionId ?? _activeSessionId ?? '';
-    final result = await call(
+    final result = await callAsync(
       'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.listSkills(${jsonEncode(id)}) : null',
     );
     if (result == null || result['ok'] != true) return const [];
@@ -287,7 +359,7 @@ class NotaraCanvasController extends ChangeNotifier {
     final id = sessionId ?? _activeSessionId ?? '';
     final web = _web;
     if (web == null || id.isEmpty) return false;
-    final result = await call(
+    final result = await callAsync(
       'window.__NOTARA_DIRECT__ ? window.__NOTARA_DIRECT__.selectSkill('
       '${jsonEncode(id)}, ${jsonEncode(skillId)}) : null',
     );

@@ -219,6 +219,15 @@ REQUIRED_FILES = (
 # 正常 rootfs 约 8 万条目(含目录和符号链接)。超过这个数说明又出现了重复归档。
 MAX_MEMBERS = 120_000
 
+# 必须仍然是符号链接、且指向固定目标的路径。少一个、或者退化成普通文件,
+# 都说明归档被解包器按"自指硬链接"处理过——那正是真机上 proot 起不来的原因。
+SYMLINKS = (
+    ("usr/bin/sh", "dash"),
+    ("bin", "usr/bin"),
+    ("sbin", "usr/sbin"),
+    ("lib", "usr/lib"),
+)
+
 
 def verify(rootfs: str) -> int:
     """把刚写出的归档当成"别人会怎么解"来验,返回解压后字节数。"""
@@ -258,6 +267,22 @@ def verify(rootfs: str) -> int:
         head = handle.read(4) if handle else b""
         if head != b"\x7fELF":
             sys.exit("usr/bin/env 不是 ELF 可执行文件(前 4 字节 %r)" % head)
+
+        # 4b. 符号链接必须还在,而且指向对的目标。
+        #     这一条是上一轮真机翻车的直接教训:畸形归档里每个文件后面还跟着
+        #     `link to <自己>`,解包器先删目标再 link,目标就是它自己。普通文件
+        #     (env、dsh、etc/group)能侥幸恢复,唯独 usr/bin/sh 这种符号链接被
+        #     连带删掉,proot 第一行就报 not found。只查"存在"不够——符号链接
+        #     被删后是同名文件缺失,而文件名检查发现不了"类型变了"。
+        for path, target in SYMLINKS:
+            member = index.get(path)
+            if member is None:
+                sys.exit("归档缺符号链接:%s(proot 启动会直接失败)" % path)
+            if not member.issym():
+                kind = "普通文件" if member.isfile() else "目录/其他"
+                sys.exit("%s 应该是符号链接,实际是%s" % (path, kind))
+            if member.linkname != target:
+                sys.exit("%s 指向 %s,应为 %s" % (path, member.linkname, target))
 
         def read(path: str) -> str:
             member = tar.extractfile(index[path])

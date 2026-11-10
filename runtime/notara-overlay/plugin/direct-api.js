@@ -198,6 +198,16 @@ export function createDirectApi({ ctx, navigation, currentSessionId, createVault
     openSummary() {
       return settled(() => invoke('summary'));
     },
+    /**
+     * 顶栏四键的统一入口。宿主只认识"按了哪个键",不知道网页内部怎么实现。
+     * 键名与 `header-actions.js` 的注册表一致:`history` / `teaching` / `summary`。
+     * 不认识的键如实回 `no_key`,不假装成功——宿主要靠这个决定是弹占位还是真开面板。
+     */
+    openHeaderAction(key) {
+      const name = text(key);
+      if (!name) return { ok: false, reason: 'no_key', key: name };
+      return settled(() => invoke(name));
+    },
     /** 当前真的有哪些面板可开,宿主据此决定按钮显示还是收起。 */
     headerActions() {
       return { ok: true, keys: registeredHeaderActions() };

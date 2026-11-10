@@ -26,7 +26,7 @@ permissions:
 
 concurrency:
   group: notara-apk-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   FLUTTER_VERSION: 3.47.9
@@ -38,6 +38,14 @@ env:
   NPM_REGISTRY: https://registry.npmjs.org
   UBUNTU_ARCHIVE_AMD64: http://archive.ubuntu.com/ubuntu
   UBUNTU_ARCHIVE_ARM64: http://ports.ubuntu.com/ubuntu-ports
+  # 干净的基础 rootfs：同一条链路全量 assemble 的产物，未叠加任何 overlay。
+  # 走 API asset 端点（私有仓库的浏览器下载链接需要会话，API + token 两种都可用）。
+  BASE_ROOTFS_URL: https://api.github.com/repos/moqing-study/dsh-Go/releases/assets/731729089
+  BASE_ROOTFS_SHA256: e29b3660eac2517bcedb5934f82bb67265cfd37a02bd2aaa651fe7fec77f60d4
+  # manifest 必须跟归档一起取:它记录的是这份归档的 sha256、字节数、入口与补丁
+  # 清单,安装器逐项校验。单取归档不取 manifest,版本号和哈希就对不上。
+  BASE_ROOTFS_MANIFEST_URL: https://api.github.com/repos/moqing-study/dsh-Go/releases/assets/731747705
+  BASE_ROOTFS_MANIFEST_SHA256: b39af4f61e6c06bbb0956d693de462894cf99777f02d8664af00e68acba1e997
   # Notara 教学引擎：未发布到 npm，只能从源码取。钉死提交，保证可复现。
   NOTARA_REPO: https://github.com/TongZi2003/Notara.git
   NOTARA_REF: 09a73bb749fe1f452ca53acdbf73fcc4b9704692
@@ -75,6 +83,11 @@ jobs:
       - name: Host tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils file gpgv
 
+      # 宿主调用的每个网页方法、每条 postMessage type,都必须两边对得上。
+      # 放在最前面:契约错了就 30 秒内失败,不用等 40 分钟的 rootfs。
+      - name: Check the host/bridge contract
+        run: python3 runtime/notara-overlay/check-contract.py
+
       - name: Cache runtime downloads
         uses: actions/cache@v4
         with:
@@ -103,13 +116,67 @@ jobs:
       # restore-keys 命中也算可用（随后由 overlay 补齐改动）。
       - name: Do we already have a base rootfs?
         id: base
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [[ -s runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz ]]; then
+          set -euo pipefail
+          archive=runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz
+          if [[ -s "$archive" ]]; then
             echo "have=1" >> "$GITHUB_OUTPUT"
-            echo "base rootfs: $(du -h runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz | cut -f1)"
-          else
-            echo "have=0" >> "$GITHUB_OUTPUT"
+            echo "base rootfs (cache): $(du -h "$archive" | cut -f1)"
+            exit 0
           fi
+          # 缓存里没有就走预置归档。上游 Ubuntu 会在新版进池后立刻删掉被取代的
+          # .deb，索引与本机缓存也会偶发不一致，全量组装因此不是每次都能跑通
+          # （2026-11-10 那次就死在 ca-certificates 上）。这份归档是同一条链路
+          # 全量组装出来的干净产物：81645 条目、0 硬链接、client.js 与上游仓库
+          # 逐字节一致、patch 里没有任何 overlay 块。sha256 钉死，先校验再用。
+          if [[ -n "${BASE_ROOTFS_URL:-}" ]]; then
+            mkdir -p "$(dirname "$archive")"
+            echo "downloading prebuilt base: $BASE_ROOTFS_URL"
+            # 私有仓库的 release 资源必须走 API 端点并带上 token；Accept 头让它
+            # 直接回二进制，而不是一段 JSON 元数据。
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 -sS \
+                 -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 -H "Accept: application/octet-stream" \
+                 -o "$archive.part" "$BASE_ROOTFS_URL"; then
+              echo "${BASE_ROOTFS_SHA256}  $archive.part" | sha256sum -c -
+              mv "$archive.part" "$archive"
+              manifest="$(dirname "$archive")/manifest.json"
+              echo "downloading the matching manifest"
+              curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 -sS \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                -o "$manifest.part" "$BASE_ROOTFS_MANIFEST_URL"
+              echo "${BASE_ROOTFS_MANIFEST_SHA256}  $manifest.part" | sha256sum -c -
+              mv "$manifest.part" "$manifest"
+              python3 - "$archive" <<'PY'
+          import hashlib, json, os, sys
+          archive = sys.argv[1]
+          manifest = os.path.join(os.path.dirname(archive), "manifest.json")
+          digest = hashlib.sha256()
+          with open(archive, "rb") as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b""):
+                  digest.update(chunk)
+          if os.path.exists(manifest):
+              data = json.load(open(manifest, encoding="utf-8"))
+          else:
+              data = {}
+          data["rootfsBytes"] = os.path.getsize(archive)
+          data["rootfsSha256"] = digest.hexdigest()
+          with open(manifest, "w", encoding="utf-8") as fh:
+              json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+              fh.write("\n")
+          print("manifest pinned to the downloaded base:", data.get("runtimeVersion"))
+          PY
+              echo "base rootfs (prebuilt): $(du -h "$archive" | cut -f1)"
+              echo "have=1" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            rm -f "$archive.part"
+            echo "prebuilt base unavailable, falling back to a full assemble"
+          fi
+          echo "have=0" >> "$GITHUB_OUTPUT"
 
       - name: Fetch the Notara teaching engine
         if: steps.base.outputs.have != '1'
@@ -197,9 +264,24 @@ jobs:
           XZ_THREADS: 4
         run: |
           set -euo pipefail
+          dir=runtime/out/arm64-v8a/assets/runtime
+          work="$dir/rootfs-arm64-v8a.tar.xz"
+          base="$dir/rootfs-base.tar.xz"
+          # 每次都从**干净输入**出发，绝不在上一次的输出上叠加。
+          # 上一轮就是在这里翻的：缓存里存的是 overlay 之后的产物，而那份产物
+          # 本身是畸形归档（每个文件后跟两条自指硬链接）。再叠一层救不回来，
+          # 只能把缓存键整个作废重跑 40 分钟。留下 base 之后，坏输出再也不会
+          # 污染下一轮——它每次都被 base 覆盖掉。
+          if [[ -s "$base" ]]; then
+            echo "starting from the preserved clean base"
+            cp -f "$base" "$work"
+          else
+            echo "first run on this base: keeping a copy as the clean input"
+            cp -f "$work" "$base"
+          fi
           python3 runtime/notara-overlay/apply.py \
-            --rootfs runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz \
-            --manifest runtime/out/arm64-v8a/assets/runtime/manifest.json
+            --rootfs "$work" \
+            --manifest "$dir/manifest.json"
 
       - name: Check the plugin really made it into the rootfs
         run: |
@@ -209,9 +291,28 @@ jobs:
             | grep -E '^\.?/?opt/dsh-go/plugins/notara-vault-native/(index\.js|package\.json)$'
           echo "--- 改动必须真的在归档里，否则就是拿旧插件骗自己 ---"
           work=$(mktemp -d)
-          tar -xJf "$archive" -C "$work" \
-            opt/dsh-go/plugins/notara-vault-native/client.js \
-            etc/dsh-app/dsh-web.patch.yml
+          # overlay 重打的归档成员名带 "./" 前缀(它把 "." 交给 tar 递归),
+          # 而全量组装的归档不带。按字面路径提取会在其中一种上静默失败,
+          # 所以用 tarfile 归一化后再取。
+          python3 - "$archive" "$work" <<'PY'
+          import sys, tarfile
+          archive, work = sys.argv[1], sys.argv[2]
+          want = {
+              "opt/dsh-go/plugins/notara-vault-native/client.js",
+              "etc/dsh-app/dsh-web.patch.yml",
+          }
+          got = set()
+          with tarfile.open(archive, "r:xz") as tar:
+              for member in tar:
+                  name = member.name[2:] if member.name.startswith("./") else member.name
+                  if name in want:
+                      tar.extract(member, work)
+                      got.add(name)
+          missing = want - got
+          if missing:
+              sys.exit("archive is missing: %s" % ", ".join(sorted(missing)))
+          print("extracted:", ", ".join(sorted(got)))
+          PY
           for needle in __NOTARA_DIRECT__ openLessonView data-nv-view nv-class-views; do
             grep -q "$needle" "$work/opt/dsh-go/plugins/notara-vault-native/client.js" \
               || { echo "MISSING $needle in client.js"; exit 1; }
@@ -227,6 +328,9 @@ jobs:
       # 把这次组装/改写后的 rootfs 存回去：下一次命中就是这一版。
       - name: Save the rootfs
         if: steps.rootfs.outputs.cache-hit != 'true'
+        # 同一个 key 已经存在时 cache/save 会失败。缓存只是加速手段,不该让
+        # 一个已经打好的 APK 因为"存缓存没成功"而作废。
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
@@ -240,6 +344,7 @@ jobs:
           name: runtime-arm64
           path: |
             runtime/out/arm64-v8a
+            !runtime/out/arm64-v8a/assets/runtime/rootfs-base.tar.xz
             runtime/out/manifest.json
           retention-days: 14
           compression-level: 0
