@@ -95,9 +95,9 @@ jobs:
           path: |
             runtime/out/arm64-v8a
             runtime/out/manifest.json
-          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
+          key: rootfs-arm64-v2-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
           restore-keys: |
-            rootfs-arm64-${{ env.NOTARA_REF }}-
+            rootfs-arm64-v2-${{ env.NOTARA_REF }}-
 
       # 缓存命中与否只看"归档在不在"，不看 actions/cache 的 cache-hit：
       # restore-keys 命中也算可用（随后由 overlay 补齐改动）。
@@ -232,7 +232,7 @@ jobs:
           path: |
             runtime/out/arm64-v8a
             runtime/out/manifest.json
-          key: rootfs-arm64-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
+          key: rootfs-arm64-v2-${{ env.NOTARA_REF }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/**', 'runtime/bridge/**', 'runtime/boot/**', 'runtime/direct/**') }}-${{ hashFiles('runtime/notara-overlay/**') }}
 
       - name: Upload the rootfs
         uses: actions/upload-artifact@v4
