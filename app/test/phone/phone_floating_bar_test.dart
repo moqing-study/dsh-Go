@@ -36,6 +36,10 @@ ProviderContainer _container(WidgetTester tester) =>
 Future<void> _reveal(WidgetTester tester) async {
   await tester.ensureVisible(find.text(_return));
   await settlePhone(tester);
+  // The opacity slider sits higher up the page; dragging from its center
+  // misses the hit test while it is scrolled out of view.
+  await tester.ensureVisible(find.byType(Slider));
+  await settlePhone(tester);
 }
 
 void main() {

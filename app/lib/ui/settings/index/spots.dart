@@ -680,6 +680,15 @@ abstract final class Spots {
     keywords: (l) => l.searchKwPhoneBackgroundGuide,
     condition: SpotCondition.phoneControlOn,
   );
+  // The guide's 「设置 › 手机操控 › Android Shell」 path resolves through this
+  // spot; the row itself is a plain ListPageRow (phone_control_screen.dart),
+  // pushed directly, but search and the guide both need it in the index.
+  static final phoneAndroidShell = SettingSpot(
+    'phone-android-shell',
+    page: SettingsPageId.phone,
+    title: (l) => l.androidShellTitle,
+    keywords: (l) => l.androidShellSubtitle,
+  );
 
   // 插件 (its 插件市场 tab; the page opens on its first tab).
   static final pluginsMarket = SettingSpot(
@@ -1072,6 +1081,7 @@ final _rows = <SettingSpot>[
   Spots.phoneAutoCollapse,
   Spots.phoneReturn,
   Spots.phoneBackgroundGuide,
+  Spots.phoneAndroidShell,
   Spots.pluginsMarket,
   Spots.webSearchKey,
   Spots.darkMode,

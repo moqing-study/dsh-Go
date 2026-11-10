@@ -487,6 +487,7 @@ class _PhoneControlScreenState extends ConsumerState<PhoneControlScreen> {
               children: [
                 ListPageRow(
                   key: const ValueKey('android-shell-entry'),
+                  spot: Spots.phoneAndroidShell,
                   icon: AppIcons.terminal,
                   title: l10n.androidShellTitle,
                   subtitle: l10n.androidShellEntryHint,

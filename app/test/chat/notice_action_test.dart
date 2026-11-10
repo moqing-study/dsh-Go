@@ -362,6 +362,12 @@ void main() {
 class _UpToDate extends AppUpdateController {
   var checks = 0;
 
+  // The base `ready` reads the `late` `_loading` that only the real `build()`
+  // assigns; this stub overrides `build()`, so hand back an already-ready
+  // future instead of tripping LateInitializationError.
+  @override
+  Future<void> get ready => Future.value();
+
   @override
   AppUpdateState build() => const AppUpdateState(loaded: true, current: AppVersion(0, 9, 7));
 
