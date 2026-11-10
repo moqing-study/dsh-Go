@@ -108,13 +108,34 @@ import 'widgets/read_only_bar.dart';
 /// 读 [currentSessionProvider];为 null 时是"新对话"空状态,第一次发送时
 /// 才建会话(create → select → send)。
 class ChatScreen extends ConsumerStatefulWidget {
-  const ChatScreen({super.key, this.onOpenDrawer, this.backdrop = true});
+  const ChatScreen({
+    super.key,
+    this.onOpenDrawer,
+    this.backdrop = true,
+    this.topBar,
+    this.customTopBar = false,
+    this.topBarHeight = 50,
+  });
 
   /// Opens the sessions drawer (the shell owns the drawer).
   final VoidCallback? onOpenDrawer;
 
   /// False when the shell already paints the page backdrop.
   final bool backdrop;
+
+  /// 外壳供给的顶栏。非 null 时替代 [ChatHeader]——教学壳的单行顶栏
+  /// (`◧ [对话|白板|教室] ⏱🎚📄⋯ ◌`)走这条路进来。
+  ///
+  /// 只换"画什么",不换"占多高":高度由 [topBarHeight] 说,列表顶部留白
+  /// 与顶栏渐隐仍按同一个数算,所以翻到白板再回来不会跳。
+  final Widget? topBar;
+
+  /// 是否由外壳接管顶栏。为 true 且 [topBar] 为 null 表示**不要顶栏**
+  /// (纯净阅读),这时只留状态栏的 inset。
+  final bool customTopBar;
+
+  /// 自定义顶栏的内容高度,不含状态栏。与 ChatHeader.barHeight 同一契约。
+  final double topBarHeight;
 
   @override
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
@@ -1656,7 +1677,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
       generate: readOnly ? null : generate,
       risk: !pillsBesideStrip,
     );
-    final headerHeight = typing ? MediaQuery.paddingOf(context).top + AppSpace.sm : ChatHeader.heightOf(context);
+    final headerHeight = widget.customTopBar
+        // 外壳接管的顶栏:按它自己的高度算,不要顶栏时只留状态栏。
+        ? MediaQuery.paddingOf(context).top + (widget.topBar == null ? 0.0 : widget.topBarHeight)
+        : typing
+        ? MediaQuery.paddingOf(context).top + AppSpace.sm
+        : ChatHeader.heightOf(context);
 
     Widget backdrop(Widget child) => widget.backdrop ? WallpaperBackdrop(child: child) : child;
     final screen = AnnotatedRegion<SystemUiOverlayStyle>(
@@ -1768,7 +1794,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
                   ),
                   LayoutId(
                     id: _Slot.header,
-                    child: _HeaderAside(
+                    child: widget.customTopBar
+                        ? (widget.topBar ?? const SizedBox.shrink())
+                        : _HeaderAside(
                       aside: typing,
                       child: ChatHeader(
                         scrolledUnder: sessionId == null ? null : _scrolledUnder,
@@ -2113,12 +2141,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
   /// than 工作区内修改 (unless [risk] is false: they are beside the activity
   /// strip), then the generation mode's capsule; nothing otherwise.
   Widget? _composerPills(String? sessionId, {required bool autoApprove, GenerateParams? generate, bool risk = true}) {
+    // 教学壳把 ChatHeader 换成了单行顶栏,模型 chip 原本挂在 header 右侧。
+    // 它不能丢:挂到 composer 这一行最前面,和「生成参数」「权限」并排,
+    // 随时能换,也从主教师模型同步(sessionId 为空时用待发的新对话选择)。
+    final pendingModel = ref.watch(pendingModelProvider);
+    final modelChip = widget.customTopBar
+        ? ModelChip(
+            selection: sessionId == null
+                ? pendingModel
+                : ref.watch(chatProvider(sessionId).select((c) => c.model)) ?? pendingModel,
+            onSelected: _modelTarget(),
+          )
+        : null;
     final capsule = generate == null
         ? null
         : GenerateCapsule(params: generate, onTap: () => _openGenerateSheet(generate), onExit: _exitGenerate);
     Widget? pill;
     if (!risk) {
       // Beside the activity strip ([_stripRisk]).
+    } else if (widget.customTopBar) {
+      // 教学模式:顶栏只有一行,composer 上方要留给模型 chip 和生成参数。
+      // 「完全权限」这类胶囊不占这一行——它是 agent 时代的旋钮,课堂里
+      // 需要的不是"允许一切",而是 Notara 自己的教学设置(🎚)。
     } else if (sessionId != null && autoApprove) {
       pill = AutoApprovePill(onDisable: () => ref.read(chatProvider(sessionId).notifier).setAutoApprove(false));
     } else if (sessionId != null) {
@@ -2132,14 +2176,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
         );
       }
     }
-    if (capsule == null) return pill;
-    if (pill == null) return capsule;
+    Widget? line;
+    if (capsule == null) {
+      line = pill;
+    } else if (pill == null) {
+      line = capsule;
+    } else {
+      line = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          pill,
+          const SizedBox(width: GenerateCapsuleMetrics.gap),
+          Flexible(child: capsule),
+        ],
+      );
+    }
+    if (modelChip == null) return line;
+    if (line == null) return modelChip;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        pill,
-        const SizedBox(width: GenerateCapsuleMetrics.gap),
-        Flexible(child: capsule),
+        modelChip,
+        const SizedBox(width: AppSpace.sm),
+        Flexible(child: line),
       ],
     );
   }

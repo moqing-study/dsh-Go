@@ -18,6 +18,7 @@ import '../../state/quick_panel_state.dart';
 import '../../state/sessions_state.dart' show currentSessionProvider;
 import '../bots/bot_alerts.dart';
 import '../chat/chat_screen.dart';
+import '../teaching/teaching_shell.dart';
 import '../chat/composer_toast.dart' show composerToastGap;
 import '../engine/engine_screen.dart';
 import '../features/all_features_page.dart';
@@ -301,7 +302,9 @@ class _HomeShellState extends ConsumerState<HomeShell> with TickerProviderStateM
         if (mounted) _quickPanel.value = 0;
       });
     }
-    final chat = widget.chatBuilder?.call(_onMenu) ?? ChatScreen(onOpenDrawer: _onMenu, backdrop: false);
+    // 教学主壳:对话是原生 ChatScreen,白板/教室共用一个常驻 WebView。
+    // 它自带单行顶栏与教学抽屉,所以不再走 HomeShell 的 ≡ 抽屉。
+    final chat = widget.chatBuilder?.call(_onMenu) ?? const TeachingShell();
     // The floating pet outside the app hears every pet state.
     ref.listen<void>(petOverlayBridgeProvider, (_, _) {});
     return SafeModeNoticeListener(
