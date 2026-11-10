@@ -115,6 +115,26 @@ pin_of() {
   if [[ -n "${PIN[$name]:-}" ]]; then printf '%s' "${PIN[$name]}"; fi
 }
 
+# fetch_any DEST SHA256 URL...: the first URL whose bytes match wins.
+# A pool echo is normal here rather than a failure: ports.ubuntu.com carries the ports
+# architectures only, so an Architecture: all package (tzdata, ca-certificates) is simply
+# not there and the primary archive has it. The sha256 is checked before anything is kept,
+# so trying more than one host cannot smuggle in different bytes.
+fetch_any() {
+  local dest="$1" want="$2"; shift 2
+  if [[ -f "$dest" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
+  local url got
+  for url in "$@"; do
+    if curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -sS -o "$dest.part" "$url" 2>/dev/null; then
+      got="$(sha256 "$dest.part")"
+      if [[ "$got" == "$want" ]]; then mv "$dest.part" "$dest"; return 0; fi
+      log "sha256 mismatch from $url; next mirror"
+      rm -f "$dest.part"
+    fi
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # inputs
 # ---------------------------------------------------------------------------
@@ -192,12 +212,21 @@ PYEOF
     # shellcheck disable=SC2086
     "${PY[@]}" resolve-debs --base "$base" --arch "$arch" "${idx[@]}" --want $UBUNTU_EXTRA --out "$lock" >&2
   fi
-  local name file sum
-  while read -r file sum; do
+  local name file sum arch_of
+  while read -r file sum arch_of; do
     name="$(basename "$file")"
-    fetch "$mirror/$file" "$CACHE/ubuntu/debs/$name" "$sum"
+    # Architecture: all lives in the primary archive only; the ports mirror has just the
+    # ports architectures. Both are tried either way, sha256 decides.
+    local -a urls=()
+    if [[ "$arch_of" == all ]]; then
+      urls+=("$UBUNTU_ARCHIVE_AMD64/$file" "$mirror/$file")
+    else
+      urls+=("$mirror/$file" "$UBUNTU_ARCHIVE_AMD64/$file")
+    fi
+    fetch_any "$CACHE/ubuntu/debs/$name" "$sum" "${urls[@]}" \
+      || die "no mirror serves $name with sha256 $sum"
     printf '%s\n' "$CACHE/ubuntu/debs/$name"
-  done < <(python3 -I -c 'import json,sys; [print(p["filename"], p["sha256"]) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")
+  done < <(python3 -I -c 'import json,sys; [print(p["filename"], p["sha256"], p["architecture"]) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")
 }
 
 # Relocatable CPython (python-build-standalone, install_only_stripped). Checksums come from the
