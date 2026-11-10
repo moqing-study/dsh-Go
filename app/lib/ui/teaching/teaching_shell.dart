@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../state/sessions_state.dart';
 import '../chat/chat_screen.dart';
 import '../settings/settings_screen.dart';
+import '../theme/app_icons.dart';
 import '../theme/theme.dart';
 import 'notara_canvas.dart';
 import 'teaching_drawer.dart';
@@ -50,6 +51,13 @@ class TeachingShell extends ConsumerStatefulWidget {
 class _TeachingShellState extends ConsumerState<TeachingShell> {
   TeachingView _view = TeachingView.chat;
 
+  /// 画布控制器:initState 里读一次存成字段。
+  ///
+  /// dispose 里 riverpod 禁止再碰 `ref`(那时 element 已经脱树,读就抛
+  /// StateError——CI 的 discard_guard / remote_traffic 就是这么红的)。
+  /// 摘 `onSessionOpened` 回调只能走这个字段。
+  late final NotaraCanvasController _canvas;
+
   /// 纯净阅读:收掉顶栏与输入区,整屏只剩正文。
   bool _pure = false;
 
@@ -64,12 +72,13 @@ class _TeachingShellState extends ConsumerState<TeachingShell> {
   @override
   void initState() {
     super.initState();
+    // 唯一一次用 ref 拿控制器,之后都走 _canvas 字段。
+    _canvas = ref.read(notaraCanvasProvider);
     // 进 App 就预热画布:对话页在用的时候,网页在后台把首屏拉起来。
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final canvas = ref.read(notaraCanvasProvider);
-      canvas.onSessionOpened = _onSessionOpened;
-      unawaited(canvas.warmUp(ref));
+      _canvas.onSessionOpened = _onSessionOpened;
+      unawaited(_canvas.warmUp(ref));
       // 注意:这里不 pause。网页要在后台把白板画完,冻结 JS 就画不出来。
     });
   }
@@ -77,7 +86,8 @@ class _TeachingShellState extends ConsumerState<TeachingShell> {
   @override
   void dispose() {
     // 回调挂在全局控制器上,壳走了必须摘掉,否则会指向一个已销毁的 State。
-    ref.read(notaraCanvasProvider).onSessionOpened = null;
+    // 走字段,不走 ref——dispose 里 ref 已失效。
+    _canvas.onSessionOpened = null;
     super.dispose();
   }
 
@@ -217,17 +227,17 @@ class _TeachingShellState extends ConsumerState<TeachingShell> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              leading: const Icon(Icons.timer_outlined),
+              leading: const Icon(AppIcons.commandTimeout),
               title: const Text('课堂历史 / 计时'),
               onTap: () => Navigator.of(context).pop('history'),
             ),
             ListTile(
-              leading: const Icon(Icons.tune),
+              leading: const Icon(AppIcons.settings),
               title: const Text('教学设置 / 讲法基调'),
               onTap: () => Navigator.of(context).pop('teaching'),
             ),
             ListTile(
-              leading: const Icon(Icons.summarize_outlined),
+              leading: const Icon(AppIcons.summary),
               title: const Text('课堂文档 / 题目小结'),
               onTap: () => Navigator.of(context).pop('summary'),
             ),
@@ -462,7 +472,7 @@ class _PureFloatingKey extends StatelessWidget {
           child: SizedBox(
             width: 44,
             height: 44,
-            child: Icon(Icons.blur_circular, size: 20, color: colors.onSurfaceVariant),
+            child: Icon(AppIcons.radioOff, size: 20, color: colors.onSurfaceVariant),
           ),
         ),
       ),

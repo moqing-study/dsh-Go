@@ -151,22 +151,28 @@ class _ViewSwitch extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        for (final item in _tabs)
-          _ViewTab(
-            label: item.label,
-            active: item == view,
-            dot: item == TeachingView.board && boardFresh,
-            onTap: () {
-              if (item == view) return;
-              HapticFeedback.selectionClick();
-              onView(item);
-            },
-            compact: compact,
-          ),
-      ],
+    // FittedBox(scaleDown):页签自然宽度装不下分配的空间时整体等比缩小,
+    // 不再让里层的 min 宽把 Row 撑溢出——CI 的 discard_guard / remote_traffic
+    // 在 360dp 视口就是差这 6px 溢出挂掉的。装得下时原样渲染,视觉无变化。
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final item in _tabs)
+            _ViewTab(
+              label: item.label,
+              active: item == view,
+              dot: item == TeachingView.board && boardFresh,
+              onTap: () {
+                if (item == view) return;
+                HapticFeedback.selectionClick();
+                onView(item);
+              },
+              compact: compact,
+            ),
+        ],
+      ),
     );
   }
 }
