@@ -325,6 +325,17 @@ jobs:
           grep -o '"runtimeVersion": *"[^"]*"' runtime/out/arm64-v8a/assets/runtime/manifest.json
           grep -o '"extraPlugins":[^]]*]' runtime/out/arm64-v8a/assets/runtime/manifest.json || true
 
+      # 预置 base / 缓存命中都只带来 rootfs+manifest,不带 Termux 二进制。
+      # 没有这一步,APK 里就没有 libproot.so,引擎启动直接 error=2
+      # (2026-11-10 的 nvcca13895 就是这么坏的:manifest 里有校验和,文件不在)。
+      # --jni-only 只补 jniLibs,不动 assets,并逐字节核对 manifest 里的 sha256。
+      - name: Build the jniLibs (proot & friends)
+        if: steps.base.outputs.have == '1'
+        run: |
+          set -euo pipefail
+          bash runtime/build-runtime.sh arm64-v8a --jni-only
+          ls -l runtime/out/arm64-v8a/jniLibs/arm64-v8a/
+
       # 把这次组装/改写后的 rootfs 存回去：下一次命中就是这一版。
       - name: Save the rootfs
         if: steps.rootfs.outputs.cache-hit != 'true'
@@ -440,9 +451,31 @@ jobs:
       - name: Verify the signature scheme and the bundled runtime
         run: |
           set -euo pipefail
+          apk="${{ steps.apk.outputs.name }}"
           apksigner=$(ls -1d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
-          "$apksigner" verify --print-certs "${{ steps.apk.outputs.name }}" | sed -n '1,8p'
-          unzip -l "${{ steps.apk.outputs.name }}" | grep -E 'assets/runtime/(rootfs|manifest)' || true
+          "$apksigner" verify --print-certs "$apk" | sed -n '1,8p'
+          unzip -l "$apk" | grep -E 'assets/runtime/(rootfs|manifest)' || true
+          # nvcca13895 那版翻车点:rootfs 一切正常,但 APK 里没有 libproot.so,
+          # 手机上引擎直接 error=2。存在性 + 与包内 manifest 的 sha256 都钉死。
+          for n in libproot.so libproot-loader.so libtalloc.so libandroid-shmem.so; do
+            unzip -l "$apk" "lib/arm64-v8a/$n" >/dev/null \
+              || { echo "MISSING lib/arm64-v8a/$n —— proot 起不来"; exit 1; }
+          done
+          python3 - "$apk" <<'PY'
+          import hashlib, json, subprocess, sys
+          apk = sys.argv[1]
+          manifest = json.loads(subprocess.run(["unzip", "-p", apk, "assets/runtime/manifest.json"],
+                                               capture_output=True, check=True).stdout)
+          expect = manifest.get("jniLibs") or {}
+          assert expect, "manifest has no jniLibs section"
+          for name, meta in sorted(expect.items()):
+              blob = subprocess.run(["unzip", "-p", apk, "lib/arm64-v8a/" + name],
+                                    capture_output=True, check=True).stdout
+              got = hashlib.sha256(blob).hexdigest()
+              assert got == str(meta["sha256"]).lower(), \
+                  f"{name}: {got[:12]} != manifest {str(meta['sha256'])[:12]}"
+          print("jniLibs verified against manifest:", ", ".join(sorted(expect)))
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

@@ -482,33 +482,19 @@ PYEOF
 # ---------------------------------------------------------------------------
 # per-ABI build
 # ---------------------------------------------------------------------------
-build_abi() {
-  local abi="$1" ubuntu_arch node_arch npm_cpu termux_arch elf_name
-  case "$abi" in
-    arm64-v8a) ubuntu_arch=arm64; node_arch=arm64; npm_cpu=arm64; termux_arch=aarch64; elf_name="ARM aarch64" ;;
-    x86_64)    ubuntu_arch=amd64; node_arch=x64;   npm_cpu=x64;   termux_arch=x86_64;  elf_name="x86-64" ;;
-    *) die "unknown ABI $abi (use arm64-v8a or x86_64)" ;;
-  esac
-  log "=== $abi ==="
-  local work="$WORK/$abi" out="$OUT/$abi"
-  local assets="$out/assets/runtime" jni="$out/jniLibs/$abi"
-  mkdir -p "$work"
-  rm -rf "$out"; mkdir -p "$assets/licenses" "$jni"
-
-  local base node proot_deb talloc_deb shmem_deb proot_src
-  base="$(ubuntu_base "$ubuntu_arch")"
-  node="$(node_dist "$node_arch")"
-  ubuntu_extra_debs "$ubuntu_arch" "$base" > "$work/extra-debs.txt"   # set -e aborts on any failure inside
-  local -a extra_debs=(); mapfile -t extra_debs < "$work/extra-debs.txt"
-  [[ ${#extra_debs[@]} -gt 0 ]] || die "Ubuntu package resolution produced nothing"
-  local python; python="$(python_dist "$termux_arch")"
+# jniLibs: Termux binaries, renamed lib*.so so the package manager extracts
+# them and they stay executable on the device. Split out of [build_abi] so the
+# prebuilt-base shortcut can rebuild them on its own (2026-11-10: the shortcut
+# shipped an APK without libproot.so because only the full assemble made them).
+build_jni_libs() {  # $1=abi $2=termux_arch $3=work $4=assets $5=jni
+  local abi="$1" termux_arch="$2" work="$3" assets="$4" jni="$5"
+  local proot_deb talloc_deb shmem_deb proot_src
   proot_deb="$(termux_deb proot "$PROOT_VERSION" "$termux_arch")"
   talloc_deb="$(termux_deb libtalloc "$TALLOC_VERSION" "$termux_arch")"
   shmem_deb="$(termux_deb libandroid-shmem "$SHMEM_VERSION" "$termux_arch")"
   proot_src="$CACHE/termux/proot-v$PROOT_VERSION.zip"
   fetch "https://github.com/termux/proot/archive/v$PROOT_VERSION.zip" "$proot_src" "$(pin_of "proot-v$PROOT_VERSION.zip")"
 
-  # -- jniLibs: Termux binaries, renamed lib*.so so the package manager extracts them --
   local debx="$work/debs"; rm -rf "$debx"
   local d
   for d in "$proot_deb" "$talloc_deb" "$shmem_deb"; do "${PY[@]}" deb-extract "$d" "$debx"; done
@@ -560,6 +546,69 @@ open(sys.argv[2], "wb").write(z.read(name))
 PYEOF
   cp "$debx/data/data/com.termux/files/usr/share/doc/libandroid-shmem/copyright" "$assets/licenses/libandroid-shmem-copyright.txt"
   sed -n '1,/\*\//p' "$tprefix/include/talloc.h" > "$assets/licenses/libtalloc-notice.txt"
+}
+
+# Only (re)builds the jniLibs for one ABI, then checks every file against the
+# manifest already sitting in $OUT — the prebuilt-base shortcut has the manifest
+# from the full assemble, so a mismatch here means the pinned debs drifted and
+# the build must fail rather than ship a proot the manifest cannot vouch for.
+build_jni_only() {
+  local abi="$1" termux_arch
+  case "$abi" in
+    arm64-v8a) termux_arch=aarch64 ;;
+    x86_64)    termux_arch=x86_64 ;;
+    *) die "unknown ABI $abi (use arm64-v8a or x86_64)" ;;
+  esac
+  local out="$OUT/$abi"
+  local assets="$out/assets/runtime" jni="$out/jniLibs/$abi" work="$WORK/$abi"
+  local manifest="$assets/manifest.json"
+  [[ -f "$manifest" ]] || die "--jni-only: $manifest missing — run the full assemble (or fetch the prebuilt base) first"
+  mkdir -p "$work" "$jni"
+  build_jni_libs "$abi" "$termux_arch" "$work" "$assets" "$jni"
+  python3 -I - "$manifest" "$jni" <<'PYEOF'
+import hashlib, json, os, sys
+manifest, jni = sys.argv[1:3]
+expect = json.load(open(manifest)).get("jniLibs") or {}
+if not expect:
+    print("[runtime] manifest has no jniLibs section; nothing to verify", flush=True)
+    raise SystemExit(0)
+bad = []
+for name, meta in sorted(expect.items()):
+    path = os.path.join(jni, name)
+    if not os.path.isfile(path):
+        bad.append("%s missing" % name); continue
+    got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if got != meta.get("sha256"):
+        bad.append("%s sha256 %s != manifest %s" % (name, got[:12], str(meta.get("sha256"))[:12]))
+if bad:
+    print("[runtime] jniLibs mismatch:", "; ".join(bad), flush=True)
+    raise SystemExit(1)
+print("[runtime] jniLibs verified against manifest: %d files" % len(expect), flush=True)
+PYEOF
+}
+
+build_abi() {
+  local abi="$1" ubuntu_arch node_arch npm_cpu termux_arch elf_name
+  case "$abi" in
+    arm64-v8a) ubuntu_arch=arm64; node_arch=arm64; npm_cpu=arm64; termux_arch=aarch64; elf_name="ARM aarch64" ;;
+    x86_64)    ubuntu_arch=amd64; node_arch=x64;   npm_cpu=x64;   termux_arch=x86_64;  elf_name="x86-64" ;;
+    *) die "unknown ABI $abi (use arm64-v8a or x86_64)" ;;
+  esac
+  log "=== $abi ==="
+  local work="$WORK/$abi" out="$OUT/$abi"
+  local assets="$out/assets/runtime" jni="$out/jniLibs/$abi"
+  mkdir -p "$work"
+  rm -rf "$out"; mkdir -p "$assets/licenses" "$jni"
+
+  local base node
+  base="$(ubuntu_base "$ubuntu_arch")"
+  node="$(node_dist "$node_arch")"
+  ubuntu_extra_debs "$ubuntu_arch" "$base" > "$work/extra-debs.txt"   # set -e aborts on any failure inside
+  local -a extra_debs=(); mapfile -t extra_debs < "$work/extra-debs.txt"
+  [[ ${#extra_debs[@]} -gt 0 ]] || die "Ubuntu package resolution produced nothing"
+  local python; python="$(python_dist "$termux_arch")"
+
+  build_jni_libs "$abi" "$termux_arch" "$work" "$assets" "$jni"
 
   # -- DSH --
   local prefix="$work/dsh-prefix"
@@ -670,10 +719,24 @@ PYEOF
 }
 
 main() {
-  local -a abis=("$@")
+  local jni_only=0
+  local -a abis=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --jni-only) jni_only=1 ;;
+      *) abis+=("$arg") ;;
+    esac
+  done
   [[ ${#abis[@]} -gt 0 ]] || abis=(x86_64 arm64-v8a)
   mkdir -p "$CACHE" "$WORK" "$OUT"
   local abi
+  if [[ $jni_only == 1 ]]; then
+    # Prebuilt-base shortcut: the rootfs+manifest already exist, only the
+    # Termux binaries are missing. Never touch the assets here.
+    for abi in "${abis[@]}"; do build_jni_only "$abi"; done
+    return
+  fi
   for abi in "${abis[@]}"; do build_abi "$abi"; done
   write_index
 }
